@@ -1,9 +1,10 @@
 import os
 import requests
-from typing import List, Dict, Any
-import anthropic
+from typing import Dict, Any
+from openai import OpenAI
 import logging
 from datetime import datetime
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -11,7 +12,7 @@ logger = logging.getLogger(__name__)
 class CodeReviewAgent:
     def __init__(self, github_token: str = None):
         self.github_token = github_token or os.getenv('GITHUB_TOKEN')
-        self.anthropic_client = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
+        self.openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         self.headers = {}
         if self.github_token:
             self.headers['Authorization'] = f'token {self.github_token}'
@@ -76,13 +77,17 @@ Example format:
 ]"""
 
         try:
-            message = self.anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=2048,
-                messages=[{"role": "user", "content": prompt}]
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are an expert code reviewer. Return only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=2048
             )
             
-            response_text = message.content[0].text.strip()
+            response_text = response.choices[0].message.content.strip()
             
             if response_text.startswith('```json'):
                 response_text = response_text[7:]
@@ -90,7 +95,6 @@ Example format:
                 response_text = response_text[:-3]
             response_text = response_text.strip()
             
-            import json
             issues = json.loads(response_text)
             
             return {
@@ -124,7 +128,7 @@ Example format:
             return {
                 'pr_title': pr_data['pr'].get('title', ''),
                 'pr_url': pr_data['pr'].get('html_url', ''),
-                'analyzed_at': datetime.now().isoformat(),
+                'analyzed_at': datetime.utcnow().isoformat(),
                 'files': analyzed_files,
                 'summary': {
                     'total_files': len(analyzed_files),
