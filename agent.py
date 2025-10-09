@@ -61,39 +61,38 @@ class CodeReviewAgent:
         
         logger.info(f"Analyzing file: {filename}")
         
-        prompt = f"""You are an expert code reviewer. Analyze the following code diff and identify issues.
+        prompt = f"""You are a STRICT code reviewer. Analyze this code diff and find ALL issues, even minor ones.
 
 File: {filename}
 Diff:
 {patch}
 
-Provide a structured analysis focusing on:
-1. Code style and formatting issues
-2. Potential bugs or errors
-3. Performance improvements
-4. Best practices violations
+Check for:
+1. **Style Issues:** spacing, naming conventions (PEP 8 for Python), line length (>80 chars), missing docstrings
+2. **Bugs:** division by zero, null/None checks, exception handling, logic errors
+3. **Performance:** inefficient loops, redundant operations, memory issues
+4. **Best Practices:** missing type hints, poor variable names, code smells, magic numbers
 
-For each issue found, provide:
-- type: "style", "bug", "performance", or "best_practice"
-- line: the line number (extract from diff context)
-- description: brief description of the issue
-- suggestion: how to fix it
+Be CRITICAL and thorough. Even minor style issues should be reported.
 
-Return ONLY a JSON array of issues. If no issues, return an empty array.
-Example format:
+Return a JSON array with ALL issues found:
 [
-  {{"type": "style", "line": 15, "description": "Line too long", "suggestion": "Break into multiple lines"}},
-  {{"type": "bug", "line": 23, "description": "Potential null pointer", "suggestion": "Add null check"}}
-]"""
+  {{"type": "style", "line": 15, "description": "Missing space after comma", "suggestion": "Add space: x, y instead of x,y"}},
+  {{"type": "bug", "line": 23, "description": "Potential division by zero", "suggestion": "Add check: if y != 0"}},
+  {{"type": "style", "line": 30, "description": "Class name should use PascalCase", "suggestion": "Rename myClass to MyClass"}},
+  {{"type": "best_practice", "line": 10, "description": "Missing docstring", "suggestion": "Add function docstring"}}
+]
+
+If truly no issues exist, return []. But be thorough - look for ANY violations of coding standards."""
 
         try:
             completion = self.openai_client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
-                    {"role": "system", "content": "You are an expert code reviewer. Return only valid JSON."},
+                    {"role": "system", "content": "You are a STRICT, critical code reviewer who finds ALL issues. Always look for style violations, bugs, and best practice violations. Be thorough and pedantic. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
+                temperature=0.2,
                 max_tokens=2048
             )
             
