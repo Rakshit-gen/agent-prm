@@ -12,7 +12,14 @@ logger = logging.getLogger(__name__)
 class CodeReviewAgent:
     def __init__(self, github_token: str = None):
         self.github_token = github_token or os.getenv('GITHUB_TOKEN')
-        self.openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        openai_api_key = os.getenv('OPENAI_API_KEY')
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY not found in environment variables")
+    
+        self.openai_client = OpenAI(
+            api_key=openai_api_key
+        )
+    
         self.headers = {}
         if self.github_token:
             self.headers['Authorization'] = f'token {self.github_token}'
