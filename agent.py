@@ -83,7 +83,7 @@ Return a JSON array with ALL issues found:
   {{"type": "best_practice", "line": 10, "description": "Missing docstring", "suggestion": "Add function docstring"}}
 ]
 
-If truly no issues exist, return []. But be thorough - look for ANY violations of coding standards."""
+If truly no issues exist, return []. But be thorough - look for ANY violations of coding standards. also give ai review of the pr about how do you judge it to be. rate it out of 10"""
 
         try:
             completion = self.openai_client.chat.completions.create(
