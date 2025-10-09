@@ -16,10 +16,19 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="AI Code Review Agent")
 
 REDIS_URL = os.getenv("REDIS_URL")
-if not REDIS_URL:
-    raise Exception("REDIS_URL environment variable not set!")
+if REDIS_URL:
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()
+        logger.info("Redis connected successfully")
+    except Exception as e:
+        logger.error(f"Redis connection failed: {e}")
+        redis_client = None
+else:
+    logger.warning("REDIS_URL not set, using in-memory storage")
+    redis_client = None
 
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+tasks_store: Dict[str, Dict[str, Any]] = {}
 
 class PRRequest(BaseModel):
     repo_url: str
@@ -72,7 +81,6 @@ class CodeReviewAgent:
             }
         
         logger.info(f"Analyzing file: {filename}")
-        logger.info(f"Patch length: {len(patch)} characters")
         
         prompt = f"""You are a STRICT code reviewer. Analyze this code diff and find ALL issues, even minor ones.
 
@@ -114,8 +122,6 @@ If NO issues, return []"""
             if response_text.endswith('```'):
                 response_text = response_text[:-3]
             response_text = response_text.strip()
-            
-            logger.info(f"AI Response: {response_text[:200]}...")
             
             issues = json.loads(response_text)
             
@@ -166,34 +172,67 @@ If NO issues, return []"""
             logger.error(f"Error in analyze_pr: {str(e)}")
             raise
 
+def save_task(task_id: str, data: Dict[str, Any]):
+    if redis_client:
+        try:
+            redis_client.set(f"task:{task_id}", json.dumps(data), ex=86400)
+        except Exception as e:
+            logger.error(f"Redis save error: {e}")
+            tasks_store[task_id] = data
+    else:
+        tasks_store[task_id] = data
+
+def get_task(task_id: str) -> Dict[str, Any]:
+    if redis_client:
+        try:
+            data = redis_client.get(f"task:{task_id}")
+            return json.loads(data) if data else None
+        except Exception as e:
+            logger.error(f"Redis get error: {e}")
+            return tasks_store.get(task_id)
+    else:
+        return tasks_store.get(task_id)
+
 def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_token: str = None):
     try:
-        redis_client.hset(f"task:{task_id}", "status", "processing")
+        task_data = get_task(task_id)
+        if task_data:
+            task_data['status'] = 'processing'
+            save_task(task_id, task_data)
+        
         logger.info(f"Starting PR analysis for task {task_id}")
         
         agent = CodeReviewAgent(github_token)
         results = agent.analyze_pr(repo_url, pr_number)
         
-        redis_client.hset(f"task:{task_id}", "status", "completed")
-        redis_client.hset(f"task:{task_id}", "results", json.dumps(results))
+        task_data = get_task(task_id)
+        if task_data:
+            task_data['status'] = 'completed'
+            task_data['results'] = results
+            save_task(task_id, task_data)
+        
         logger.info(f"Completed PR analysis for task {task_id}")
     except Exception as e:
-        redis_client.hset(f"task:{task_id}", "status", "failed")
-        redis_client.hset(f"task:{task_id}", "error", str(e))
         logger.error(f"Failed PR analysis for task {task_id}: {str(e)}")
+        task_data = get_task(task_id)
+        if task_data:
+            task_data['status'] = 'failed'
+            task_data['error'] = str(e)
+            save_task(task_id, task_data)
 
 @app.post("/analyze-pr")
 async def analyze_pr(request: PRRequest, background_tasks: BackgroundTasks):
     try:
         task_id = str(uuid.uuid4())
         
-        redis_client.hset(f"task:{task_id}", mapping={
+        task_data = {
             "status": "pending",
             "created_at": datetime.utcnow().isoformat(),
             "repo_url": request.repo_url,
-            "pr_number": str(request.pr_number)
-        })
-        redis_client.expire(f"task:{task_id}", 86400)
+            "pr_number": request.pr_number
+        }
+        
+        save_task(task_id, task_data)
         
         background_tasks.add_task(
             process_pr_analysis,
@@ -217,7 +256,7 @@ async def analyze_pr(request: PRRequest, background_tasks: BackgroundTasks):
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
     try:
-        task_data = redis_client.hgetall(f"task:{task_id}")
+        task_data = get_task(task_id)
         
         if not task_data:
             raise HTTPException(status_code=404, detail="Task not found")
@@ -241,7 +280,7 @@ async def get_status(task_id: str):
 @app.get("/results/{task_id}")
 async def get_results(task_id: str):
     try:
-        task_data = redis_client.hgetall(f"task:{task_id}")
+        task_data = get_task(task_id)
         
         if not task_data:
             raise HTTPException(status_code=404, detail="Task not found")
@@ -255,11 +294,10 @@ async def get_results(task_id: str):
         elif status == 'failed':
             raise HTTPException(status_code=500, detail=f"Task failed: {task_data.get('error')}")
         elif status == 'completed':
-            results = json.loads(task_data.get('results', '{}'))
             return {
                 "task_id": task_id,
                 "status": "completed",
-                "results": results
+                "results": task_data.get('results', {})
             }
         else:
             raise HTTPException(status_code=500, detail=f"Unknown task state: {status}")
@@ -274,6 +312,7 @@ async def root():
     return {
         "message": "AI Code Review Agent API (Powered by Groq)",
         "version": "1.0.0",
+        "storage": "Redis" if redis_client else "In-Memory",
         "endpoints": {
             "POST /analyze-pr": "Submit a PR for analysis",
             "GET /status/{task_id}": "Check task status",
@@ -283,52 +322,34 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    try:
-        redis_client.ping()
-        return {
-            "status": "healthy",
-            "redis": "connected",
-            "ai": "groq-llama-3.3-70b",
-            "timestamp": datetime.utcnow().isoformat()
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "redis": "disconnected",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
-        }
+    redis_status = "disconnected"
+    if redis_client:
+        try:
+            redis_client.ping()
+            redis_status = "connected"
+        except:
+            redis_status = "error"
+    
+    return {
+        "status": "healthy",
+        "redis": redis_status,
+        "storage": "Redis" if redis_client else "In-Memory",
+        "ai": "groq-llama-3.3-70b",
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
-@app.get("/debug/redis/{task_id}")
-async def debug_redis(task_id: str):
-    try:
-        task_data = redis_client.hgetall(f"task:{task_id}")
-        
-        all_keys = redis_client.keys("task:*")
-        
-        return {
-            "task_id": task_id,
-            "data": task_data,
-            "all_task_keys": all_keys[:10],
-            "total_tasks": len(all_keys)
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/debug/redis-all")
-async def debug_redis_all():
-    try:
-        all_keys = redis_client.keys("*")
-        tasks = {}
-        
-        for key in all_keys[:20]:
-            data = redis_client.hgetall(key)
-            tasks[key] = data
-        
-        return {
-            "total_keys": len(all_keys),
-            "sample_keys": all_keys[:20],
-            "sample_data": tasks
-        }
-    except Exception as e:
-        return {"error": str(e)}
+@app.get("/debug/tasks")
+async def debug_tasks():
+    if redis_client:
+        try:
+            keys = redis_client.keys("task:*")
+            tasks = []
+            for key in keys[:20]:
+                data = redis_client.get(key)
+                if data:
+                    tasks.append(json.loads(data))
+            return {"total": len(keys), "tasks": tasks}
+        except Exception as e:
+            return {"error": str(e), "fallback": list(tasks_store.values())[:20]}
+    else:
+        return {"total": len(tasks_store), "tasks": list(tasks_store.values())[:20]}
