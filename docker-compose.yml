@@ -3,39 +3,35 @@ version: '3.8'
 services:
   redis:
     image: redis:7-alpine
+    container_name: code-review-redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
 
   api:
     build: .
+    container_name: code-review-api
     ports:
       - "8000:8000"
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
       - GITHUB_TOKEN=${GITHUB_TOKEN}
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - REDIS_URL=redis://redis:6379
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
       - .:/app
-
-  worker:
-    build: .
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-    depends_on:
-      - redis
-    command: celery -A tasks worker --loglevel=info
-    volumes:
-      - .:/app
+    restart: unless-stopped
 
 volumes:
   redis_data:
