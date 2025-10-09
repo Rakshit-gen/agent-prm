@@ -298,3 +298,37 @@ async def health_check():
             "error": str(e),
             "timestamp": datetime.utcnow().isoformat()
         }
+
+@app.get("/debug/redis/{task_id}")
+async def debug_redis(task_id: str):
+    try:
+        task_data = redis_client.hgetall(f"task:{task_id}")
+        
+        all_keys = redis_client.keys("task:*")
+        
+        return {
+            "task_id": task_id,
+            "data": task_data,
+            "all_task_keys": all_keys[:10],
+            "total_tasks": len(all_keys)
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/debug/redis-all")
+async def debug_redis_all():
+    try:
+        all_keys = redis_client.keys("*")
+        tasks = {}
+        
+        for key in all_keys[:20]:
+            data = redis_client.hgetall(key)
+            tasks[key] = data
+        
+        return {
+            "total_keys": len(all_keys),
+            "sample_keys": all_keys[:20],
+            "sample_data": tasks
+        }
+    except Exception as e:
+        return {"error": str(e)}
