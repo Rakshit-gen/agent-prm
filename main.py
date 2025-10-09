@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 from typing import Dict, Any
 import requests
-from openai import OpenAI
+from groq import Groq
 import logging
 import json
 import redis
@@ -29,7 +29,12 @@ class PRRequest(BaseModel):
 class CodeReviewAgent:
     def __init__(self, github_token: str = None):
         self.github_token = github_token or os.getenv('GITHUB_TOKEN')
-        self.openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
+        groq_api_key = os.getenv('GROQ_API_KEY')
+        if not groq_api_key:
+            raise ValueError("GROQ_API_KEY not found in environment variables")
+        
+        self.groq_client = Groq(api_key=groq_api_key)
         self.headers = {}
         if self.github_token:
             self.headers['Authorization'] = f'token {self.github_token}'
@@ -67,40 +72,38 @@ class CodeReviewAgent:
             }
         
         logger.info(f"Analyzing file: {filename}")
+        logger.info(f"Patch length: {len(patch)} characters")
         
-        prompt = f"""You are an expert code reviewer. Analyze the following code diff and identify issues.
+        prompt = f"""You are a STRICT code reviewer. Analyze this code diff and find ALL issues, even minor ones.
 
 File: {filename}
 Diff:
 {patch}
 
-Provide a structured analysis focusing on:
-1. Code style and formatting issues
-2. Potential bugs or errors
-3. Performance improvements
-4. Best practices violations
+Check for:
+1. **Style Issues:** spacing, naming conventions (PEP 8), line length (>80 chars), missing docstrings
+2. **Bugs:** division by zero, null checks, exception handling, logic errors
+3. **Performance:** inefficient loops, redundant operations
+4. **Best Practices:** missing type hints, poor variable names, magic numbers
 
-For each issue found, provide:
-- type: "style", "bug", "performance", or "best_practice"
-- line: the line number (extract from diff context)
-- description: brief description of the issue
-- suggestion: how to fix it
+Be CRITICAL and thorough. Even minor style issues should be reported.
 
-Return ONLY a JSON array of issues. If no issues, return an empty array.
-Example format:
+Return ONLY a JSON array of issues:
 [
-  {{"type": "style", "line": 15, "description": "Line too long", "suggestion": "Break into multiple lines"}},
-  {{"type": "bug", "line": 23, "description": "Potential null pointer", "suggestion": "Add null check"}}
-]"""
+  {{"type": "style", "line": 1, "description": "Missing space after comma", "suggestion": "Add space: x, y"}},
+  {{"type": "bug", "line": 2, "description": "Division by zero risk", "suggestion": "Add check: if y != 0"}}
+]
+
+If NO issues, return []"""
 
         try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o",
+            response = self.groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
                 messages=[
-                    {"role": "system", "content": "You are an expert code reviewer. Return only valid JSON."},
+                    {"role": "system", "content": "You are a STRICT code reviewer. Find ALL issues. Return only valid JSON array."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
+                temperature=0.2,
                 max_tokens=2048
             )
             
@@ -112,6 +115,8 @@ Example format:
                 response_text = response_text[:-3]
             response_text = response_text.strip()
             
+            logger.info(f"AI Response: {response_text[:200]}...")
+            
             issues = json.loads(response_text)
             
             return {
@@ -122,7 +127,8 @@ Example format:
             logger.error(f"Error analyzing file {filename}: {str(e)}")
             return {
                 'name': filename,
-                'issues': []
+                'issues': [],
+                'error': str(e)
             }
     
     def analyze_pr(self, repo_url: str, pr_number: int) -> Dict[str, Any]:
@@ -137,7 +143,7 @@ Example format:
                 file_analysis = self.analyze_file_diff(file_data)
                 analyzed_files.append(file_analysis)
                 
-                for issue in file_analysis['issues']:
+                for issue in file_analysis.get('issues', []):
                     total_issues += 1
                     if issue.get('type') in ['bug', 'security']:
                         critical_issues += 1
@@ -266,7 +272,7 @@ async def get_results(task_id: str):
 @app.get("/")
 async def root():
     return {
-        "message": "AI Code Review Agent API",
+        "message": "AI Code Review Agent API (Powered by Groq)",
         "version": "1.0.0",
         "endpoints": {
             "POST /analyze-pr": "Submit a PR for analysis",
@@ -282,6 +288,7 @@ async def health_check():
         return {
             "status": "healthy",
             "redis": "connected",
+            "ai": "groq-llama-3.3-70b",
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
