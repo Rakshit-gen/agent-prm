@@ -337,20 +337,6 @@ async def health_check():
         "ai": "groq-llama-3.3-70b",
         "timestamp": datetime.utcnow().isoformat()
     }
-@app.post("/admin/flush-redis")
-async def flush_redis(confirm: str = ""):
-    if confirm != "YES_DELETE_ALL":
-        return {"message": "Add ?confirm=YES_DELETE_ALL to flush Redis"}
-    
-    if redis_client:
-        try:
-            redis_client.flushall()
-            return {"message": "Redis flushed successfully"}
-        except Exception as e:
-            return {"error": str(e)}
-    else:
-        tasks_store.clear()
-        return {"message": "In-memory storage cleared"}
 
 @app.get("/debug/tasks")
 async def debug_tasks():
