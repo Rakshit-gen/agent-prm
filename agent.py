@@ -1,7 +1,6 @@
 import os
 import requests
 from typing import Dict, Any
-from openai import OpenAI
 import logging
 from datetime import datetime
 import json
@@ -12,14 +11,18 @@ logger = logging.getLogger(__name__)
 class CodeReviewAgent:
     def __init__(self, github_token: str = None):
         self.github_token = github_token or os.getenv('GITHUB_TOKEN')
+        
         openai_api_key = os.getenv('OPENAI_API_KEY')
         if not openai_api_key:
             raise ValueError("OPENAI_API_KEY not found in environment variables")
-    
-        self.openai_client = OpenAI(
-            api_key=openai_api_key
-        )
-    
+        
+        try:
+            from openai import OpenAI
+            self.openai_client = OpenAI(api_key=openai_api_key)
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenAI client: {str(e)}")
+            raise
+        
         self.headers = {}
         if self.github_token:
             self.headers['Authorization'] = f'token {self.github_token}'
@@ -84,7 +87,7 @@ Example format:
 ]"""
 
         try:
-            response = self.openai_client.chat.completions.create(
+            completion = self.openai_client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": "You are an expert code reviewer. Return only valid JSON."},
@@ -94,7 +97,7 @@ Example format:
                 max_tokens=2048
             )
             
-            response_text = response.choices[0].message.content.strip()
+            response_text = completion.choices[0].message.content.strip()
             
             if response_text.startswith('```json'):
                 response_text = response_text[7:]
@@ -112,7 +115,8 @@ Example format:
             logger.error(f"Error analyzing file {filename}: {str(e)}")
             return {
                 'name': filename,
-                'issues': []
+                'issues': [],
+                'error': str(e)
             }
     
     def analyze_pr(self, repo_url: str, pr_number: int) -> Dict[str, Any]:
@@ -127,7 +131,7 @@ Example format:
                 file_analysis = self.analyze_file_diff(file_data)
                 analyzed_files.append(file_analysis)
                 
-                for issue in file_analysis['issues']:
+                for issue in file_analysis.get('issues', []):
                     total_issues += 1
                     if issue.get('type') in ['bug', 'security']:
                         critical_issues += 1
