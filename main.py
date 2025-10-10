@@ -224,7 +224,7 @@ def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_toke
             save_task(task_id, task_data)
 
 @app.post("/analyze-pr")
-@rate_limit(max_requests=10, window_seconds=60)
+# @rate_limit(max_requests=10, window_seconds=60)
 async def analyze_pr(request: Request, pr_request: PRRequest, background_tasks: BackgroundTasks):
     try:
         task_id = str(uuid.uuid4())
