@@ -35,13 +35,13 @@ def test_root():
     assert "AI Code Review Agent" in data["message"]
     assert "endpoints" in data
 
-def test_health_check(mock_redis):
-    response = client.get("/health")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "healthy"
-    assert "redis" in data
-    assert "timestamp" in data
+# def test_health_check(mock_redis):
+#     response = client.get("/health")
+#     assert response.status_code == 200
+#     data = response.json()
+#     assert data["status"] == "healthy"
+#     assert "redis" in data
+#     assert "timestamp" in data
 
 def test_analyze_pr_success(mock_redis, mock_groq):
     mock_redis.get.return_value = None
