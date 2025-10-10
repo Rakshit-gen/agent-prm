@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel
 import uuid
 import os
@@ -9,6 +9,7 @@ from groq import Groq
 import logging
 import json
 import redis
+from rate_limiter import RateLimiter, rate_limit
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,6 +28,8 @@ if REDIS_URL:
 else:
     logger.warning("REDIS_URL not set, using in-memory storage")
     redis_client = None
+
+app.state.rate_limiter = RateLimiter(redis_client)
 
 tasks_store: Dict[str, Dict[str, Any]] = {}
 
@@ -221,15 +224,16 @@ def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_toke
             save_task(task_id, task_data)
 
 @app.post("/analyze-pr")
-async def analyze_pr(request: PRRequest, background_tasks: BackgroundTasks):
+@rate_limit(max_requests=10, window_seconds=60)
+async def analyze_pr(request: Request, pr_request: PRRequest, background_tasks: BackgroundTasks):
     try:
         task_id = str(uuid.uuid4())
         
         task_data = {
             "status": "pending",
             "created_at": datetime.utcnow().isoformat(),
-            "repo_url": request.repo_url,
-            "pr_number": request.pr_number
+            "repo_url": pr_request.repo_url,
+            "pr_number": pr_request.pr_number
         }
         
         save_task(task_id, task_data)
@@ -237,9 +241,9 @@ async def analyze_pr(request: PRRequest, background_tasks: BackgroundTasks):
         background_tasks.add_task(
             process_pr_analysis,
             task_id,
-            request.repo_url,
-            request.pr_number,
-            request.github_token
+            pr_request.repo_url,
+            pr_request.pr_number,
+            pr_request.github_token
         )
         
         logger.info(f"Created task {task_id}")
