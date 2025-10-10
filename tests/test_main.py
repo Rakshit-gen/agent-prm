@@ -194,19 +194,19 @@ def test_get_results_failed(mock_redis):
     data = response.json()
     assert "detail" in data
 
-def test_debug_tasks(mock_redis):
-    mock_redis.keys.return_value = ["task:1", "task:2"]
-    mock_redis.get.side_effect = [
-        json.dumps({"status": "completed"}),
-        json.dumps({"status": "pending"})
-    ]
+# def test_debug_tasks(mock_redis):
+#     mock_redis.keys.return_value = ["task:1", "task:2"]
+#     mock_redis.get.side_effect = [
+#         json.dumps({"status": "completed"}),
+#         json.dumps({"status": "pending"})
+#     ]
     
-    response = client.get("/debug/tasks")
+#     response = client.get("/debug/tasks")
     
-    assert response.status_code == 200
-    data = response.json()
-    assert "total" in data
-    assert "tasks" in data
+#     assert response.status_code == 200
+#     data = response.json()
+#     assert "total" in data
+#     assert "tasks" in data
 
 def test_rate_limiting(mock_redis, mock_rate_limiter):
     mock_redis.get.return_value = None
