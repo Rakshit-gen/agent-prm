@@ -12,25 +12,33 @@ import redis
 from rate_limiter import RateLimiter, rate_limit
 from fastapi.middleware.cors import CORSMiddleware
 
+# ============================================================
+# LOGGING CONFIG
+# ============================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# FASTAPI INIT
+# ============================================================
 app = FastAPI(title="AI Code Review Agent")
 
-# Allow local dev and deployed frontend
+# Allow CORS (local + future prod domain)
 origins = [
     "http://localhost:3000",
-    "https://code-bot-rho.vercel.app",  # if deployed later
+    "https://code-bot-rho.vercel.app/",
 ]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # or ["*"] for testing (not safe for prod)
+    allow_origins=origins,  # ["*"] for testing only
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ============================================================
+# REDIS CONNECTION
+# ============================================================
 REDIS_URL = os.getenv("REDIS_URL")
 if REDIS_URL:
     try:
@@ -45,144 +53,171 @@ else:
     redis_client = None
 
 app.state.rate_limiter = RateLimiter(redis_client)
-
 tasks_store: Dict[str, Dict[str, Any]] = {}
 
+# ============================================================
+# REQUEST MODEL
+# ============================================================
 class PRRequest(BaseModel):
     repo_url: str
     pr_number: int
     github_token: str = None
 
+
+# ============================================================
+# MAIN AGENT CLASS
+# ============================================================
 class CodeReviewAgent:
     def __init__(self, github_token: str = None):
         self.github_token = github_token or os.getenv('GITHUB_TOKEN')
-        
         groq_api_key = os.getenv('GROQ_API_KEY')
+
         if not groq_api_key:
             raise ValueError("GROQ_API_KEY not found in environment variables")
-        
+
         self.groq_client = Groq(api_key=groq_api_key)
         self.headers = {}
         if self.github_token:
             self.headers['Authorization'] = f'token {self.github_token}'
-        
+
+    # ------------------------------------------------------------
+    # Fetch PR + files
+    # ------------------------------------------------------------
     def fetch_pr_data(self, repo_url: str, pr_number: int) -> Dict[str, Any]:
         parts = repo_url.rstrip('/').split('github.com/')[-1].split('/')
-        owner = parts[0]
-        repo = parts[1]
-        
+        owner, repo = parts[0], parts[1]
+
         logger.info(f"Fetching PR data for {owner}/{repo} #{pr_number}")
-        
         pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
         response = requests.get(pr_url, headers=self.headers)
         response.raise_for_status()
         pr_data = response.json()
-        
+
         files_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
         response = requests.get(files_url, headers=self.headers)
         response.raise_for_status()
         files_data = response.json()
-        
-        return {
-            'pr': pr_data,
-            'files': files_data
-        }
-    
+
+        return {"pr": pr_data, "files": files_data}
+
+    # ------------------------------------------------------------
+    # Analyze a single file diff using Groq Llama model
+    # ------------------------------------------------------------
     def analyze_file_diff(self, file_data: Dict[str, Any]) -> Dict[str, Any]:
-        filename = file_data.get('filename', '')
-        patch = file_data.get('patch', '')
-        
+        filename = file_data.get("filename", "")
+        patch = file_data.get("patch", "")
+
         if not patch:
-            return {
-                'name': filename,
-                'issues': []
-            }
-        
+            return {"name": filename, "issues": []}
+
         logger.info(f"Analyzing file: {filename}")
-        
-        prompt = f"""You are a STRICT code reviewer. Analyze this code diff and find ALL issues, even minor ones.
+
+        prompt = f"""
+You are a senior code reviewer. Analyze this GitHub diff and identify ALL issues (critical + minor).
 
 File: {filename}
+
 Diff:
 {patch}
 
-Check for:
-1. **Style Issues:** spacing, naming conventions (PEP 8), line length (>80 chars), missing docstrings
-2. **Bugs:** division by zero, null checks, exception handling, logic errors
-3. **Performance:** inefficient loops, redundant operations
-4. **Best Practices:** missing type hints, poor variable names, magic numbers
+For each issue, return a JSON object with:
+- "file": "{filename}"
+- "line": line number (if known)
+- "type": "bug" | "style" | "performance" | "best_practice"
+- "description": concise explanation of the problem
+- "suggestion": clear fix recommendation
 
-Be CRITICAL and thorough. Even minor style issues should be reported.
+Return ONLY a valid JSON array. Example:
 
-Return ONLY a JSON array of issues:
 [
-  {{"type": "style", "line": 1, "description": "Missing space after comma", "suggestion": "Add space: x, y"}},
-  {{"type": "bug", "line": 2, "description": "Division by zero risk", "suggestion": "Add check: if y != 0"}}
+  {{
+    "file": "{filename}",
+    "line": 42,
+    "type": "bug",
+    "description": "Division by zero risk",
+    "suggestion": "Add a check to ensure divisor is not zero."
+  }},
+  {{
+    "file": "{filename}",
+    "line": 15,
+    "type": "style",
+    "description": "Missing space after comma",
+    "suggestion": "Add space between variables."
+  }}
 ]
 
-If NO issues, return []"""
+If no issues, return [].
+"""
 
         try:
             response = self.groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
-                    {"role": "system", "content": "You are a STRICT code reviewer. Find ALL issues. Return only valid JSON array."},
-                    {"role": "user", "content": prompt}
+                    {
+                        "role": "system",
+                        "content": "You are a strict senior code reviewer. Output only JSON array — no extra text or formatting.",
+                    },
+                    {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,
-                max_tokens=2048
+                max_tokens=2048,
             )
-            
+
             response_text = response.choices[0].message.content.strip()
-            
-            if response_text.startswith('```json'):
+            if response_text.startswith("```json"):
                 response_text = response_text[7:]
-            if response_text.endswith('```'):
+            if response_text.endswith("```"):
                 response_text = response_text[:-3]
             response_text = response_text.strip()
-            
+
             issues = json.loads(response_text)
-            
-            return {
-                'name': filename,
-                'issues': issues if isinstance(issues, list) else []
-            }
+            formatted_issues = []
+            for issue in issues if isinstance(issues, list) else []:
+                formatted_issues.append({
+                    "file": filename,
+                    "line": issue.get("line"),
+                    "type": issue.get("type"),
+                    "description": issue.get("description"),
+                    "suggestion": issue.get("suggestion"),
+                })
+
+            return {"name": filename, "issues": formatted_issues}
+
         except Exception as e:
             logger.error(f"Error analyzing file {filename}: {str(e)}")
-            return {
-                'name': filename,
-                'issues': [],
-                'error': str(e)
-            }
-    
+            return {"name": filename, "issues": [], "error": str(e)}
+
+    # ------------------------------------------------------------
+    # Analyze the entire PR
+    # ------------------------------------------------------------
     def analyze_pr(self, repo_url: str, pr_number: int) -> Dict[str, Any]:
         try:
             pr_data = self.fetch_pr_data(repo_url, pr_number)
-            
             analyzed_files = []
             total_issues = 0
             critical_issues = 0
-            
-            for file_data in pr_data['files']:
+
+            for file_data in pr_data["files"]:
                 file_analysis = self.analyze_file_diff(file_data)
                 analyzed_files.append(file_analysis)
-                
-                for issue in file_analysis.get('issues', []):
+
+                for issue in file_analysis.get("issues", []):
                     total_issues += 1
-                    if issue.get('type') in ['bug', 'security']:
+                    if issue.get("type") in ["bug", "security"]:
                         critical_issues += 1
-            
+
             return {
-                'pr_title': pr_data['pr'].get('title', ''),
-                'pr_url': pr_data['pr'].get('html_url', ''),
-                'analyzed_at': datetime.utcnow().isoformat(),
-                'files': analyzed_files,
-                'summary': {
-                    'total_files': len(analyzed_files),
-                    'total_issues': total_issues,
-                    'critical_issues': critical_issues
-                }
+                "pr_title": pr_data["pr"].get("title", ""),
+                "pr_url": pr_data["pr"].get("html_url", ""),
+                "analyzed_at": datetime.utcnow().isoformat(),
+                "files": analyzed_files,
+                "summary": {
+                    "total_files": len(analyzed_files),
+                    "total_issues": total_issues,
+                    "critical_issues": critical_issues,
+                },
             }
+
         except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP error fetching PR data: {str(e)}")
             raise Exception(f"Failed to fetch PR data: {str(e)}")
@@ -190,6 +225,10 @@ If NO issues, return []"""
             logger.error(f"Error in analyze_pr: {str(e)}")
             raise
 
+
+# ============================================================
+# TASK STORAGE HELPERS
+# ============================================================
 def save_task(task_id: str, data: Dict[str, Any]):
     if redis_client:
         try:
@@ -199,6 +238,7 @@ def save_task(task_id: str, data: Dict[str, Any]):
             tasks_store[task_id] = data
     else:
         tasks_store[task_id] = data
+
 
 def get_task(task_id: str) -> Dict[str, Any]:
     if redis_client:
@@ -211,166 +251,112 @@ def get_task(task_id: str) -> Dict[str, Any]:
     else:
         return tasks_store.get(task_id)
 
+
+# ============================================================
+# BACKGROUND PROCESS
+# ============================================================
 def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_token: str = None):
     try:
         task_data = get_task(task_id)
         if task_data:
-            task_data['status'] = 'processing'
+            task_data["status"] = "processing"
             save_task(task_id, task_data)
-        
+
         logger.info(f"Starting PR analysis for task {task_id}")
-        
         agent = CodeReviewAgent(github_token)
         results = agent.analyze_pr(repo_url, pr_number)
-        
+
         task_data = get_task(task_id)
         if task_data:
-            task_data['status'] = 'completed'
-            task_data['results'] = results
+            task_data["status"] = "completed"
+            task_data["results"] = results
             save_task(task_id, task_data)
-        
+
         logger.info(f"Completed PR analysis for task {task_id}")
+
     except Exception as e:
         logger.error(f"Failed PR analysis for task {task_id}: {str(e)}")
         task_data = get_task(task_id)
         if task_data:
-            task_data['status'] = 'failed'
-            task_data['error'] = str(e)
+            task_data["status"] = "failed"
+            task_data["error"] = str(e)
             save_task(task_id, task_data)
 
+
+# ============================================================
+# ROUTES
+# ============================================================
 @app.post("/analyze-pr")
 @rate_limit(max_requests=10, window_seconds=60)
 async def analyze_pr(request: Request, pr_request: PRRequest, background_tasks: BackgroundTasks):
     try:
         task_id = str(uuid.uuid4())
-        
         task_data = {
             "status": "pending",
             "created_at": datetime.utcnow().isoformat(),
             "repo_url": pr_request.repo_url,
-            "pr_number": pr_request.pr_number
+            "pr_number": pr_request.pr_number,
         }
-        
         save_task(task_id, task_data)
-        
+
         background_tasks.add_task(
             process_pr_analysis,
             task_id,
             pr_request.repo_url,
             pr_request.pr_number,
-            pr_request.github_token
+            pr_request.github_token,
         )
-        
+
         logger.info(f"Created task {task_id}")
-        
-        return {
-            "task_id": task_id,
-            "status": "pending",
-            "message": "PR analysis task created successfully"
-        }
+        return {"task_id": task_id, "status": "pending", "message": "PR analysis task created successfully"}
+
     except Exception as e:
         logger.error(f"Error creating task: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
-    try:
-        task_data = get_task(task_id)
-        
-        if not task_data:
-            raise HTTPException(status_code=404, detail="Task not found")
-        
-        response = {
-            "task_id": task_id,
-            "status": task_data.get('status', 'unknown'),
-            "created_at": task_data.get('created_at')
-        }
-        
-        if task_data.get('status') == 'failed':
-            response['error'] = task_data.get('error')
-        
-        return response
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting status: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    task_data = get_task(task_id)
+    if not task_data:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    response = {
+        "task_id": task_id,
+        "status": task_data.get("status", "unknown"),
+        "created_at": task_data.get("created_at"),
+    }
+    if task_data.get("status") == "failed":
+        response["error"] = task_data.get("error")
+    return response
+
 
 @app.get("/results/{task_id}")
 async def get_results(task_id: str):
-    try:
-        task_data = get_task(task_id)
-        
-        if not task_data:
-            raise HTTPException(status_code=404, detail="Task not found")
-        
-        status = task_data.get('status')
-        
-        if status == 'pending':
-            raise HTTPException(status_code=202, detail="Task is still pending")
-        elif status == 'processing':
-            raise HTTPException(status_code=202, detail="Task is being processed")
-        elif status == 'failed':
-            raise HTTPException(status_code=500, detail=f"Task failed: {task_data.get('error')}")
-        elif status == 'completed':
-            return {
-                "task_id": task_id,
-                "status": "completed",
-                "results": task_data.get('results', {})
-            }
-        else:
-            raise HTTPException(status_code=500, detail=f"Unknown task state: {status}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting results: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    task_data = get_task(task_id)
+    if not task_data:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    status = task_data.get("status")
+    if status in ["pending", "processing"]:
+        raise HTTPException(status_code=202, detail=f"Task {status}")
+    elif status == "failed":
+        raise HTTPException(status_code=500, detail=f"Task failed: {task_data.get('error')}")
+    elif status == "completed":
+        return {"task_id": task_id, "status": "completed", "results": task_data.get("results", {})}
+    else:
+        raise HTTPException(status_code=500, detail=f"Unknown task state: {status}")
+
 
 @app.get("/")
 async def root():
     return {
         "message": "AI Code Review Agent API (Powered by Groq)",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "storage": "Redis" if redis_client else "In-Memory",
         "endpoints": {
             "POST /analyze-pr": "Submit a PR for analysis",
             "GET /status/{task_id}": "Check task status",
-            "GET /results/{task_id}": "Get analysis results"
-        }
+            "GET /results/{task_id}": "Get analysis results",
+        },
     }
-
-'''
-@app.get("/health")
-async def health_check():
-    redis_status = "disconnected"
-    if redis_client:
-        try:
-            redis_client.ping()
-            redis_status = "connected"
-        except:
-            redis_status = "error"
-    
-    return {
-        "status": "healthy",
-        "redis": redis_status,
-        "storage": "Redis" if redis_client else "In-Memory",
-        "ai": "groq-llama-3.3-70b",
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-@app.get("/debug/tasks")
-async def debug_tasks():
-    if redis_client:
-        try:
-            keys = redis_client.keys("task:*")
-            tasks = []
-            for key in keys[:20]:
-                data = redis_client.get(key)
-                if data:
-                    tasks.append(json.loads(data))
-            return {"total": len(keys), "tasks": tasks}
-        except Exception as e:
-            return {"error": str(e), "fallback": list(tasks_store.values())[:20]}
-    else:
-        return {"total": len(tasks_store), "tasks": list(tasks_store.values())[:20]}
-'''
