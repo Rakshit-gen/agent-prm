@@ -20,7 +20,7 @@ app = FastAPI(title="AI Code Review Agent")
 # Allow local dev and deployed frontend
 origins = [
     "http://localhost:3000",
-    "https://your-frontend-domain.com",  # if deployed later
+    "https://code-bot-rho.vercel.app",  # if deployed later
 ]
 
 app.add_middleware(
