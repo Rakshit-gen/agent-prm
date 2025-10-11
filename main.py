@@ -10,11 +10,26 @@ import logging
 import json
 import redis
 from rate_limiter import RateLimiter, rate_limit
+from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI Code Review Agent")
+
+# Allow local dev and deployed frontend
+origins = [
+    "http://localhost:3000",
+    "https://your-frontend-domain.com",  # if deployed later
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # or ["*"] for testing (not safe for prod)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 REDIS_URL = os.getenv("REDIS_URL")
 if REDIS_URL:
