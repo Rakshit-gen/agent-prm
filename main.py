@@ -16,21 +16,20 @@ from fastapi.middleware.cors import CORSMiddleware
 # LOGGING CONFIG
 # ============================================================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ai-pr-review")
 
 # ============================================================
 # FASTAPI INIT
 # ============================================================
-app = FastAPI(title="AI Code Review Agent")
+app = FastAPI(title="AI Code Review Agent (Ruthless Mode)")
 
-# Allow CORS (local + future prod domain)
 origins = [
     "http://localhost:3000",
-    "https://code-bot-rho.vercel.app/",
+    "https://code-bot-rho.vercel.app",
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # ["*"] for testing only
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -63,14 +62,13 @@ class PRRequest(BaseModel):
     pr_number: int
     github_token: str = None
 
-
 # ============================================================
-# MAIN AGENT CLASS
+# CODE REVIEW AGENT
 # ============================================================
 class CodeReviewAgent:
     def __init__(self, github_token: str = None):
-        self.github_token = github_token or os.getenv('GITHUB_TOKEN')
-        groq_api_key = os.getenv('GROQ_API_KEY')
+        self.github_token = github_token or os.getenv("GITHUB_TOKEN")
+        groq_api_key = os.getenv("GROQ_API_KEY")
 
         if not groq_api_key:
             raise ValueError("GROQ_API_KEY not found in environment variables")
@@ -78,13 +76,13 @@ class CodeReviewAgent:
         self.groq_client = Groq(api_key=groq_api_key)
         self.headers = {}
         if self.github_token:
-            self.headers['Authorization'] = f'token {self.github_token}'
+            self.headers["Authorization"] = f"token {self.github_token}"
 
     # ------------------------------------------------------------
-    # Fetch PR + files
+    # FETCH PR + FILES
     # ------------------------------------------------------------
     def fetch_pr_data(self, repo_url: str, pr_number: int) -> Dict[str, Any]:
-        parts = repo_url.rstrip('/').split('github.com/')[-1].split('/')
+        parts = repo_url.rstrip("/").split("github.com/")[-1].split("/")
         owner, repo = parts[0], parts[1]
 
         logger.info(f"Fetching PR data for {owner}/{repo} #{pr_number}")
@@ -101,7 +99,7 @@ class CodeReviewAgent:
         return {"pr": pr_data, "files": files_data}
 
     # ------------------------------------------------------------
-    # Analyze a single file diff using Groq Llama model
+    # ULTRA-STRICT DIFF ANALYSIS
     # ------------------------------------------------------------
     def analyze_file_diff(self, file_data: Dict[str, Any]) -> Dict[str, Any]:
         filename = file_data.get("filename", "")
@@ -110,43 +108,51 @@ class CodeReviewAgent:
         if not patch:
             return {"name": filename, "issues": []}
 
-        logger.info(f"Analyzing file: {filename}")
+        logger.info(f"Analyzing file: {filename} (STRICT MODE)")
 
         prompt = f"""
-You are a senior code reviewer. Analyze this GitHub diff and identify ALL issues (critical + minor).
+You are a **ruthless, detail-obsessed senior code reviewer**.  
+You review code like a military auditor — find **every** possible issue, from the smallest nitpick to the biggest bug.  
+You never say “looks good”. If you find nothing critical, complain about structure, readability, naming, spacing, or missing docs.  
+No mercy.
+
+Analyze this GitHub diff:
 
 File: {filename}
 
 Diff:
 {patch}
 
-For each issue, return a JSON object with:
-- "file": "{filename}"
-- "line": line number (if known)
-- "type": "bug" | "style" | "performance" | "best_practice"
-- "description": concise explanation of the problem
-- "suggestion": clear fix recommendation
+Report even the smallest problems.  
 
-Return ONLY a valid JSON array. Example:
+Return **ONLY a valid JSON array** of issues.  
+Each issue must have:
+- "file": file name  
+- "line": approximate line number (integer or null)  
+- "type": one of ["bug", "style", "performance", "security", "maintainability", "readability"]  
+- "description": concise but specific explanation  
+- "suggestion": clear recommendation for fixing or improving  
 
+### Examples
 [
+  {{
+    "file": "{filename}",
+    "line": 12,
+    "type": "style",
+    "description": "Missing space after comma; inconsistent indentation.",
+    "suggestion": "Use proper PEP8 spacing and re-indent code."
+  }},
   {{
     "file": "{filename}",
     "line": 42,
     "type": "bug",
-    "description": "Division by zero risk",
-    "suggestion": "Add a check to ensure divisor is not zero."
-  }},
-  {{
-    "file": "{filename}",
-    "line": 15,
-    "type": "style",
-    "description": "Missing space after comma",
-    "suggestion": "Add space between variables."
+    "description": "Division by zero risk not handled.",
+    "suggestion": "Add a check before division to avoid runtime error."
   }}
 ]
 
-If no issues, return [].
+If code looks fine, **still return style and best-practice feedback**.  
+Never return an empty list unless the diff is completely empty.
 """
 
         try:
@@ -155,11 +161,11 @@ If no issues, return [].
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a strict senior code reviewer. Output only JSON array — no extra text or formatting.",
+                        "content": "You are an unforgiving, ultra-strict code reviewer. Output only valid JSON. Never skip small issues.",
                     },
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.2,
+                temperature=0.1,
                 max_tokens=2048,
             )
 
@@ -181,6 +187,16 @@ If no issues, return [].
                     "suggestion": issue.get("suggestion"),
                 })
 
+            # If no issues returned (model too lenient), inject forced feedback
+            if not formatted_issues:
+                formatted_issues = [{
+                    "file": filename,
+                    "line": None,
+                    "type": "readability",
+                    "description": "Model returned no issues — likely false negative. Manually mark for readability review.",
+                    "suggestion": "Review file structure, variable naming, and consistency manually."
+                }]
+
             return {"name": filename, "issues": formatted_issues}
 
         except Exception as e:
@@ -188,7 +204,7 @@ If no issues, return [].
             return {"name": filename, "issues": [], "error": str(e)}
 
     # ------------------------------------------------------------
-    # Analyze the entire PR
+    # ANALYZE ENTIRE PR
     # ------------------------------------------------------------
     def analyze_pr(self, repo_url: str, pr_number: int) -> Dict[str, Any]:
         try:
@@ -225,7 +241,6 @@ If no issues, return [].
             logger.error(f"Error in analyze_pr: {str(e)}")
             raise
 
-
 # ============================================================
 # TASK STORAGE HELPERS
 # ============================================================
@@ -250,7 +265,6 @@ def get_task(task_id: str) -> Dict[str, Any]:
             return tasks_store.get(task_id)
     else:
         return tasks_store.get(task_id)
-
 
 # ============================================================
 # BACKGROUND PROCESS
@@ -281,7 +295,6 @@ def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_toke
             task_data["status"] = "failed"
             task_data["error"] = str(e)
             save_task(task_id, task_data)
-
 
 # ============================================================
 # ROUTES
@@ -314,7 +327,6 @@ async def analyze_pr(request: Request, pr_request: PRRequest, background_tasks: 
         logger.error(f"Error creating task: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
     task_data = get_task(task_id)
@@ -329,7 +341,6 @@ async def get_status(task_id: str):
     if task_data.get("status") == "failed":
         response["error"] = task_data.get("error")
     return response
-
 
 @app.get("/results/{task_id}")
 async def get_results(task_id: str):
@@ -347,16 +358,22 @@ async def get_results(task_id: str):
     else:
         raise HTTPException(status_code=500, detail=f"Unknown task state: {status}")
 
-
 @app.get("/")
 async def root():
     return {
-        "message": "AI Code Review Agent API (Powered by Groq)",
-        "version": "1.0.1",
+        "message": "AI Code Review Agent (Ruthless Mode, Powered by Groq)",
+        "version": "2.1.0",
         "storage": "Redis" if redis_client else "In-Memory",
         "endpoints": {
-            "POST /analyze-pr": "Submit a PR for analysis",
+            "POST /analyze-pr": "Submit a PR for strict AI review",
             "GET /status/{task_id}": "Check task status",
-            "GET /results/{task_id}": "Get analysis results",
+            "GET /results/{task_id}": "Get strict analysis results",
         },
     }
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
