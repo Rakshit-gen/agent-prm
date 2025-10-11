@@ -10,15 +10,6 @@ import logging
 import json
 import redis
 from rate_limiter import RateLimiter, rate_limit
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend domain
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
