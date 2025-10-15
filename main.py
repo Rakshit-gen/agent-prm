@@ -1,9 +1,10 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+from typing import Dict, Any, List, Optional
+from datetime import datetime
+from enum import Enum
 import uuid
 import os
-from datetime import datetime
-from typing import Dict, Any
 import requests
 from groq import Groq
 import logging
@@ -12,32 +13,122 @@ import redis
 from rate_limiter import RateLimiter, rate_limit
 from fastapi.middleware.cors import CORSMiddleware
 
-# ============================================================
-# LOGGING CONFIG
-# ============================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-pr-review")
 
-# ============================================================
-# FASTAPI INIT
-# ============================================================
+class IssueType(str, Enum):
+    BUG = "bug"
+    STYLE = "style"
+    PERFORMANCE = "performance"
+    SECURITY = "security"
+    MAINTAINABILITY = "maintainability"
+    READABILITY = "readability"
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class PRRequest(BaseModel):
+    repo_url: str = Field(..., description="GitHub repository URL", examples=["https://github.com/owner/repo"])
+    pr_number: int = Field(..., gt=0, description="Pull request number", examples=[123])
+    github_token: Optional[str] = Field(None, description="GitHub personal access token")
+    
+    @field_validator('repo_url')
+    @classmethod
+    def validate_github_url(cls, v):
+        if "github.com" not in v:
+            raise ValueError("Must be a valid GitHub repository URL")
+        return v
+
+class Issue(BaseModel):
+    file: str = Field(..., description="File name where issue was found")
+    line: Optional[int] = Field(None, ge=1, description="Line number in file")
+    type: IssueType = Field(..., description="Type of issue")
+    description: str = Field(..., min_length=1, description="Issue description")
+    suggestion: str = Field(..., min_length=1, description="Suggested fix")
+    
+    class Config:
+        use_enum_values = True
+
+class FileAnalysis(BaseModel):
+    name: str = Field(..., description="File name")
+    issues: List[Issue] = Field(default_factory=list, description="List of issues found")
+    error: Optional[str] = Field(None, description="Error message if analysis failed")
+    
+    @property
+    def issue_count(self) -> int:
+        return len(self.issues)
+    
+    @property
+    def critical_issue_count(self) -> int:
+        return sum(1 for issue in self.issues if issue.type in [IssueType.BUG, IssueType.SECURITY])
+
+class AnalysisSummary(BaseModel):
+    total_files: int = Field(..., ge=0, description="Total number of files analyzed")
+    total_issues: int = Field(..., ge=0, description="Total number of issues found")
+    critical_issues: int = Field(..., ge=0, description="Number of critical issues")
+    
+    @model_validator(mode='after')
+    def validate_issue_counts(self):
+        if self.critical_issues > self.total_issues:
+            raise ValueError("Critical issues cannot exceed total issues")
+        return self
+
+class PRAnalysisResult(BaseModel):
+    pr_title: str = Field(..., description="Pull request title")
+    pr_url: str = Field(..., description="Pull request URL")
+    analyzed_at: datetime = Field(..., description="Analysis timestamp")
+    files: List[FileAnalysis] = Field(default_factory=list, description="File analysis results")
+    summary: AnalysisSummary = Field(..., description="Analysis summary")
+    
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat()}
+
+class TaskResponse(BaseModel):
+    task_id: str = Field(..., description="Unique task identifier")
+    status: TaskStatus = Field(..., description="Current task status")
+    message: str = Field(..., description="Response message")
+
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    status: TaskStatus
+    created_at: Optional[str] = None
+    error: Optional[str] = None
+
+class TaskResultResponse(BaseModel):
+    task_id: str
+    status: TaskStatus
+    results: Optional[PRAnalysisResult] = None
+
+class TaskData(BaseModel):
+    status: TaskStatus
+    created_at: str
+    repo_url: str
+    pr_number: int
+    results: Optional[PRAnalysisResult] = None
+    error: Optional[str] = None
+
+class GitHubPRData(BaseModel):
+    title: str
+    html_url: str
+
+class GitHubFileData(BaseModel):
+    filename: str
+    patch: Optional[str] = None
+
 app = FastAPI(title="AI Code Review Agent (Ruthless Mode)")
 
-origins = [
-    "http://localhost:3000",
-    "https://code-bot-rho.vercel.app",
-]
+origins = ["http://localhost:3000", "https://code-bot-rho.vercel.app"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================
-# REDIS CONNECTION
-# ============================================================
 REDIS_URL = os.getenv("REDIS_URL")
 if REDIS_URL:
     try:
@@ -54,186 +145,112 @@ else:
 app.state.rate_limiter = RateLimiter(redis_client)
 tasks_store: Dict[str, Dict[str, Any]] = {}
 
-# ============================================================
-# REQUEST MODEL
-# ============================================================
-class PRRequest(BaseModel):
-    repo_url: str
-    pr_number: int
-    github_token: str = None
-
-# ============================================================
-# CODE REVIEW AGENT
-# ============================================================
 class CodeReviewAgent:
     def __init__(self, github_token: str = None):
         self.github_token = github_token or os.getenv("GITHUB_TOKEN")
         groq_api_key = os.getenv("GROQ_API_KEY")
-
         if not groq_api_key:
             raise ValueError("GROQ_API_KEY not found in environment variables")
-
         self.groq_client = Groq(api_key=groq_api_key)
         self.headers = {}
         if self.github_token:
             self.headers["Authorization"] = f"token {self.github_token}"
 
-    # ------------------------------------------------------------
-    # FETCH PR + FILES
-    # ------------------------------------------------------------
     def fetch_pr_data(self, repo_url: str, pr_number: int) -> Dict[str, Any]:
         parts = repo_url.rstrip("/").split("github.com/")[-1].split("/")
         owner, repo = parts[0], parts[1]
-
         logger.info(f"Fetching PR data for {owner}/{repo} #{pr_number}")
         pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
         response = requests.get(pr_url, headers=self.headers)
         response.raise_for_status()
         pr_data = response.json()
-
         files_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
         response = requests.get(files_url, headers=self.headers)
         response.raise_for_status()
         files_data = response.json()
-
         return {"pr": pr_data, "files": files_data}
 
-    # ------------------------------------------------------------
-    # ULTRA-STRICT DIFF ANALYSIS
-    # ------------------------------------------------------------
-    def analyze_file_diff(self, file_data: Dict[str, Any]) -> Dict[str, Any]:
+    def analyze_file_diff(self, file_data: Dict[str, Any]) -> FileAnalysis:
         filename = file_data.get("filename", "")
         patch = file_data.get("patch", "")
-
         if not patch:
-            return {"name": filename, "issues": []}
-
+            return FileAnalysis(name=filename, issues=[])
         logger.info(f"Analyzing file: {filename} (STRICT MODE)")
-
-        prompt = f"""
-You are a **ruthless, detail-obsessed senior code reviewer**.  
-You review code like a military auditor — find **every** possible issue, from the smallest nitpick to the biggest bug.  
-You never say “looks good”. If you find nothing critical, complain about structure, readability, naming, spacing, or missing docs.  
-No mercy.
+        prompt = f"""You are a ruthless, detail-obsessed senior code reviewer. Find every possible issue.
 
 Analyze this GitHub diff:
-
 File: {filename}
-
 Diff:
 {patch}
 
-Report even the smallest problems.  
+Return ONLY a valid JSON array of issues. Each issue must have:
+- "file": file name
+- "line": approximate line number (integer or null)
+- "type": one of ["bug", "style", "performance", "security", "maintainability", "readability"]
+- "description": concise but specific explanation
+- "suggestion": clear recommendation for fixing
 
-Return **ONLY a valid JSON array** of issues.  
-Each issue must have:
-- "file": file name  
-- "line": approximate line number (integer or null)  
-- "type": one of ["bug", "style", "performance", "security", "maintainability", "readability"]  
-- "description": concise but specific explanation  
-- "suggestion": clear recommendation for fixing or improving  
+Example:
+[{{"file": "{filename}", "line": 12, "type": "style", "description": "Missing space after comma", "suggestion": "Use proper spacing"}}]
 
-### Examples
-[
-  {{
-    "file": "{filename}",
-    "line": 12,
-    "type": "style",
-    "description": "Missing space after comma; inconsistent indentation.",
-    "suggestion": "Use proper PEP8 spacing and re-indent code."
-  }},
-  {{
-    "file": "{filename}",
-    "line": 42,
-    "type": "bug",
-    "description": "Division by zero risk not handled.",
-    "suggestion": "Add a check before division to avoid runtime error."
-  }}
-]
-
-If code looks fine, **still return style and best-practice feedback**.  
-Never return an empty list unless the diff is completely empty.
-"""
+If code looks fine, still return style feedback. Never return an empty list."""
 
         try:
             response = self.groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an unforgiving, ultra-strict code reviewer. Output only valid JSON. Never skip small issues.",
-                    },
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": "You are an unforgiving code reviewer. Output only valid JSON."},
+                    {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
                 max_tokens=2048,
             )
-
             response_text = response.choices[0].message.content.strip()
             if response_text.startswith("```json"):
                 response_text = response_text[7:]
             if response_text.endswith("```"):
                 response_text = response_text[:-3]
             response_text = response_text.strip()
-
-            issues = json.loads(response_text)
-            formatted_issues = []
-            for issue in issues if isinstance(issues, list) else []:
-                formatted_issues.append({
-                    "file": filename,
-                    "line": issue.get("line"),
-                    "type": issue.get("type"),
-                    "description": issue.get("description"),
-                    "suggestion": issue.get("suggestion"),
-                })
-
-            # If no issues returned (model too lenient), inject forced feedback
-            if not formatted_issues:
-                formatted_issues = [{
-                    "file": filename,
-                    "line": None,
-                    "type": "readability",
-                    "description": "Model returned no issues — likely false negative. Manually mark for readability review.",
-                    "suggestion": "Review file structure, variable naming, and consistency manually."
-                }]
-
-            return {"name": filename, "issues": formatted_issues}
-
+            issues_data = json.loads(response_text)
+            issues = [Issue(**issue) for issue in issues_data] if isinstance(issues_data, list) else []
+            if not issues:
+                issues = [Issue(
+                    file=filename,
+                    line=None,
+                    type=IssueType.READABILITY,
+                    description="Model returned no issues — likely false negative.",
+                    suggestion="Review file structure and naming manually."
+                )]
+            return FileAnalysis(name=filename, issues=issues)
         except Exception as e:
             logger.error(f"Error analyzing file {filename}: {str(e)}")
-            return {"name": filename, "issues": [], "error": str(e)}
+            return FileAnalysis(name=filename, issues=[], error=str(e))
 
-    # ------------------------------------------------------------
-    # ANALYZE ENTIRE PR
-    # ------------------------------------------------------------
-    def analyze_pr(self, repo_url: str, pr_number: int) -> Dict[str, Any]:
+    def analyze_pr(self, repo_url: str, pr_number: int) -> PRAnalysisResult:
         try:
             pr_data = self.fetch_pr_data(repo_url, pr_number)
             analyzed_files = []
             total_issues = 0
             critical_issues = 0
-
             for file_data in pr_data["files"]:
                 file_analysis = self.analyze_file_diff(file_data)
                 analyzed_files.append(file_analysis)
-
-                for issue in file_analysis.get("issues", []):
+                for issue in file_analysis.issues:
                     total_issues += 1
-                    if issue.get("type") in ["bug", "security"]:
+                    if issue.type in [IssueType.BUG, IssueType.SECURITY]:
                         critical_issues += 1
-
-            return {
-                "pr_title": pr_data["pr"].get("title", ""),
-                "pr_url": pr_data["pr"].get("html_url", ""),
-                "analyzed_at": datetime.utcnow().isoformat(),
-                "files": analyzed_files,
-                "summary": {
-                    "total_files": len(analyzed_files),
-                    "total_issues": total_issues,
-                    "critical_issues": critical_issues,
-                },
-            }
-
+            summary = AnalysisSummary(
+                total_files=len(analyzed_files),
+                total_issues=total_issues,
+                critical_issues=critical_issues
+            )
+            return PRAnalysisResult(
+                pr_title=pr_data["pr"].get("title", ""),
+                pr_url=pr_data["pr"].get("html_url", ""),
+                analyzed_at=datetime.utcnow(),
+                files=analyzed_files,
+                summary=summary
+            )
         except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP error fetching PR data: {str(e)}")
             raise Exception(f"Failed to fetch PR data: {str(e)}")
@@ -241,122 +258,111 @@ Never return an empty list unless the diff is completely empty.
             logger.error(f"Error in analyze_pr: {str(e)}")
             raise
 
-# ============================================================
-# TASK STORAGE HELPERS
-# ============================================================
-def save_task(task_id: str, data: Dict[str, Any]):
+def save_task(task_id: str, data: TaskData):
+    data_dict = data.model_dump(mode='json')
     if redis_client:
         try:
-            redis_client.set(f"task:{task_id}", json.dumps(data), ex=86400)
+            redis_client.set(f"task:{task_id}", json.dumps(data_dict), ex=86400)
         except Exception as e:
             logger.error(f"Redis save error: {e}")
-            tasks_store[task_id] = data
+            tasks_store[task_id] = data_dict
     else:
-        tasks_store[task_id] = data
+        tasks_store[task_id] = data_dict
 
-
-def get_task(task_id: str) -> Dict[str, Any]:
+def get_task(task_id: str) -> Optional[TaskData]:
     if redis_client:
         try:
             data = redis_client.get(f"task:{task_id}")
-            return json.loads(data) if data else None
+            return TaskData(**json.loads(data)) if data else None
         except Exception as e:
             logger.error(f"Redis get error: {e}")
-            return tasks_store.get(task_id)
+            data_dict = tasks_store.get(task_id)
+            return TaskData(**data_dict) if data_dict else None
     else:
-        return tasks_store.get(task_id)
+        data_dict = tasks_store.get(task_id)
+        return TaskData(**data_dict) if data_dict else None
 
-# ============================================================
-# BACKGROUND PROCESS
-# ============================================================
 def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_token: str = None):
     try:
         task_data = get_task(task_id)
         if task_data:
-            task_data["status"] = "processing"
+            task_data.status = TaskStatus.PROCESSING
             save_task(task_id, task_data)
-
         logger.info(f"Starting PR analysis for task {task_id}")
         agent = CodeReviewAgent(github_token)
         results = agent.analyze_pr(repo_url, pr_number)
-
         task_data = get_task(task_id)
         if task_data:
-            task_data["status"] = "completed"
-            task_data["results"] = results
+            task_data.status = TaskStatus.COMPLETED
+            task_data.results = results
             save_task(task_id, task_data)
-
         logger.info(f"Completed PR analysis for task {task_id}")
-
     except Exception as e:
         logger.error(f"Failed PR analysis for task {task_id}: {str(e)}")
         task_data = get_task(task_id)
         if task_data:
-            task_data["status"] = "failed"
-            task_data["error"] = str(e)
+            task_data.status = TaskStatus.FAILED
+            task_data.error = str(e)
             save_task(task_id, task_data)
 
-# ============================================================
-# ROUTES
-# ============================================================
-@app.post("/analyze-pr")
+@app.post("/analyze-pr", response_model=TaskResponse)
 @rate_limit(max_requests=10, window_seconds=60)
 async def analyze_pr(request: Request, pr_request: PRRequest, background_tasks: BackgroundTasks):
     try:
         task_id = str(uuid.uuid4())
-        task_data = {
-            "status": "pending",
-            "created_at": datetime.utcnow().isoformat(),
-            "repo_url": pr_request.repo_url,
-            "pr_number": pr_request.pr_number,
-        }
+        task_data = TaskData(
+            status=TaskStatus.PENDING,
+            created_at=datetime.utcnow().isoformat(),
+            repo_url=pr_request.repo_url,
+            pr_number=pr_request.pr_number
+        )
         save_task(task_id, task_data)
-
         background_tasks.add_task(
             process_pr_analysis,
             task_id,
             pr_request.repo_url,
             pr_request.pr_number,
-            pr_request.github_token,
+            pr_request.github_token
         )
-
         logger.info(f"Created task {task_id}")
-        return {"task_id": task_id, "status": "pending", "message": "PR analysis task created successfully"}
-
+        return TaskResponse(
+            task_id=task_id,
+            status=TaskStatus.PENDING,
+            message="PR analysis task created successfully"
+        )
     except Exception as e:
         logger.error(f"Error creating task: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/status/{task_id}")
+@app.get("/status/{task_id}", response_model=TaskStatusResponse)
 async def get_status(task_id: str):
     task_data = get_task(task_id)
     if not task_data:
         raise HTTPException(status_code=404, detail="Task not found")
+    return TaskStatusResponse(
+        task_id=task_id,
+        status=task_data.status,
+        created_at=task_data.created_at,
+        error=task_data.error
+    )
 
-    response = {
-        "task_id": task_id,
-        "status": task_data.get("status", "unknown"),
-        "created_at": task_data.get("created_at"),
-    }
-    if task_data.get("status") == "failed":
-        response["error"] = task_data.get("error")
-    return response
-
-@app.get("/results/{task_id}")
+@app.get("/results/{task_id}", response_model=TaskResultResponse)
 async def get_results(task_id: str):
     task_data = get_task(task_id)
     if not task_data:
         raise HTTPException(status_code=404, detail="Task not found")
-
-    status = task_data.get("status")
-    if status in ["pending", "processing"]:
-        raise HTTPException(status_code=202, detail=f"Task {status}")
-    elif status == "failed":
-        raise HTTPException(status_code=500, detail=f"Task failed: {task_data.get('error')}")
-    elif status == "completed":
-        return {"task_id": task_id, "status": "completed", "results": task_data.get("results", {})}
+    if task_data.status in [TaskStatus.PENDING, TaskStatus.PROCESSING]:
+        raise HTTPException(status_code=202, detail=f"Task {task_data.status.value}")
+    elif task_data.status == TaskStatus.FAILED:
+        raise HTTPException(status_code=500, detail=f"Task failed: {task_data.error}")
+    elif task_data.status == TaskStatus.COMPLETED:
+        return TaskResultResponse(
+            task_id=task_id,
+            status=TaskStatus.COMPLETED,
+            results=task_data.results
+        )
     else:
-        raise HTTPException(status_code=500, detail=f"Unknown task state: {status}")
+        raise HTTPException(status_code=500, detail=f"Unknown task state: {task_data.status}")
 
 @app.get("/")
 async def root():
@@ -367,13 +373,10 @@ async def root():
         "endpoints": {
             "POST /analyze-pr": "Submit a PR for strict AI review",
             "GET /status/{task_id}": "Check task status",
-            "GET /results/{task_id}": "Get strict analysis results",
-        },
+            "GET /results/{task_id}": "Get strict analysis results"
+        }
     }
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
