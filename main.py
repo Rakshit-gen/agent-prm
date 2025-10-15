@@ -120,13 +120,13 @@ class GitHubFileData(BaseModel):
 
 app = FastAPI(title="AI Code Review Agent (Ruthless Mode)")
 
-origins = ["http://localhost:3000", "https://code-bot-rho.vercel.app"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 REDIS_URL = os.getenv("REDIS_URL")

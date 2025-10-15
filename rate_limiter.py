@@ -63,7 +63,6 @@ class RateLimiter:
         return max(0, max_requests - current_count)
 
 
-# ✅ FIXED decorator preserving FastAPI function signature
 def rate_limit(
     max_requests: int = 10,
     window_seconds: int = 60,
