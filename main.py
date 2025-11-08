@@ -55,8 +55,9 @@ class Issue(BaseModel):
     description: str = Field(..., min_length=1, description="Issue description")
     suggestion: str = Field(..., min_length=1, description="Suggested fix")
 
-    class Config:
-        use_enum_values = True
+    model_config = {
+        "use_enum_values": True
+    }
 
 class FileAnalysis(BaseModel):
     name: str = Field(..., description="File name")
@@ -89,8 +90,9 @@ class PRAnalysisResult(BaseModel):
     files: List[FileAnalysis] = Field(default_factory=list, description="File analysis results")
     summary: AnalysisSummary = Field(..., description="Analysis summary")
 
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
+    model_config = {
+        "json_encoders": {datetime: lambda v: v.isoformat()}
+    }
 
 class TaskResponse(BaseModel):
     task_id: str = Field(..., description="Unique task identifier")
@@ -365,28 +367,18 @@ Return a JSON array of performance issues:
         return [fetch_pr_tool, analyze_code_tool, security_scan_tool, performance_tool]
 
     def _create_agent(self) -> AgentExecutor:
-        system_template = """You are an expert code review agent with access to specialized tools.
+        system_template = """You are an expert code review agent. Perform comprehensive code reviews on GitHub pull requests.
 
-Your task is to perform comprehensive code reviews on GitHub pull requests.
+When analyzing a PR, follow this process:
+1. Fetch the PR data and files
+2. Analyze each file for code issues
+3. Perform security scans
+4. Check for performance issues
 
-Available tools:
-- fetch_pr_data: Fetch PR information and file changes from GitHub
-- analyze_code: Analyze code diffs for issues
-- security_scan: Perform security vulnerability scanning
-- performance_analysis: Analyze performance bottlenecks
-
-Process:
-1. Use fetch_pr_data to get the PR information
-2. For each file with changes, use analyze_code to identify issues
-3. Use security_scan on critical files
-4. Use performance_analysis on code with potential bottlenecks
-5. Compile all findings into a comprehensive report
-
-Be thorough and use all available tools to provide the best review possible."""
+Be thorough and systematic in your analysis."""
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_template),
-            MessagesPlaceholder(variable_name="chat_history", optional=True),
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
@@ -397,28 +389,19 @@ Be thorough and use all available tools to provide the best review possible."""
             prompt=prompt
         )
         
-        memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
-        
         agent_executor = AgentExecutor(
             agent=agent,
             tools=self.tools,
-            memory=memory,
             verbose=True,
             handle_parsing_errors=True,
-            max_iterations=15
+            max_iterations=15,
+            return_intermediate_steps=False
         )
         
         return agent_executor
 
     def analyze_pr(self, repo_url: str, pr_number: int) -> PRAnalysisResult:
         try:
-            input_text = f"Analyze pull request #{pr_number} from repository {repo_url}. Use all available tools to perform a comprehensive code review."
-            
-            result = self.agent_executor.invoke({"input": input_text})
-            
             pr_data_str = self._fetch_pr_data_tool(repo_url, pr_number)
             pr_data = json.loads(pr_data_str)
             
@@ -433,8 +416,42 @@ Be thorough and use all available tools to provide the best review possible."""
                 filename = file_data["filename"]
                 patch = file_data["patch"]
                 
+                if not patch:
+                    continue
+                
                 analysis_result = self._analyze_code_tool(filename, patch)
                 analysis_data = json.loads(analysis_result)
+                
+                security_result = self._security_scan_tool(patch, filename)
+                try:
+                    security_data = json.loads(security_result)
+                    if isinstance(security_data, list):
+                        for sec_issue in security_data:
+                            analysis_data.setdefault("issues", []).append({
+                                "file": filename,
+                                "line": None,
+                                "type": "security",
+                                "description": sec_issue.get("description", "Security issue found"),
+                                "suggestion": sec_issue.get("suggestion", "Review security implications")
+                            })
+                except:
+                    pass
+                
+                language = filename.split(".")[-1] if "." in filename else "unknown"
+                perf_result = self._performance_analysis_tool(patch, language)
+                try:
+                    perf_data = json.loads(perf_result)
+                    if isinstance(perf_data, list):
+                        for perf_issue in perf_data:
+                            analysis_data.setdefault("issues", []).append({
+                                "file": filename,
+                                "line": None,
+                                "type": "performance",
+                                "description": perf_issue.get("description", "Performance issue found"),
+                                "suggestion": perf_issue.get("suggestion", "Optimize for better performance")
+                            })
+                except:
+                    pass
                 
                 issues = []
                 for issue_data in analysis_data.get("issues", []):
@@ -472,7 +489,7 @@ Be thorough and use all available tools to provide the best review possible."""
             )
         
         except Exception as e:
-            logger.error(f"Error in agent analysis: {str(e)}")
+            logger.error(f"Error in PR analysis: {str(e)}")
             raise
 
 def save_task(task_id: str, data: TaskData):
