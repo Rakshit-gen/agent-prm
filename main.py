@@ -333,7 +333,7 @@ Return a JSON array of performance issues:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-    def _create_tools(self) -> List[Tool]:
+    def _create_tools(self) -> List[StructuredTool]:
         fetch_pr_tool = StructuredTool.from_function(
             func=self._fetch_pr_data_tool,
             name="fetch_pr_data",
