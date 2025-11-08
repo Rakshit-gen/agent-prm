@@ -11,13 +11,11 @@ import json
 import redis
 from rate_limiter import RateLimiter, rate_limit
 from fastapi.middleware.cors import CORSMiddleware
-from langchain.agents import AgentExecutor, create_structured_chat_agent
-from langchain.tools import StructuredTool
-from langchain.memory import ConversationBufferMemory
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.tools import Tool
 from langchain_groq import ChatGroq
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.prompts import PromptTemplate
 from langchain.schema import SystemMessage, HumanMessage
-from pydantic import BaseModel as PydanticBaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-pr-review")
@@ -145,22 +143,6 @@ else:
 app.state.rate_limiter = RateLimiter(redis_client)
 tasks_store: Dict[str, Dict[str, Any]] = {}
 
-class FetchPRToolInput(PydanticBaseModel):
-    repo_url: str = Field(description="GitHub repository URL")
-    pr_number: int = Field(description="Pull request number")
-
-class AnalyzeCodeToolInput(PydanticBaseModel):
-    filename: str = Field(description="Name of the file being analyzed")
-    patch: str = Field(description="Git diff patch content")
-
-class SecurityScanToolInput(PydanticBaseModel):
-    code: str = Field(description="Code content to scan for security vulnerabilities")
-    filename: str = Field(description="Name of the file being scanned")
-
-class PerformanceAnalysisToolInput(PydanticBaseModel):
-    code: str = Field(description="Code content to analyze for performance issues")
-    language: str = Field(description="Programming language of the code")
-
 class CodeReviewAgentSystem:
     def __init__(self, github_token: str = None):
         self.github_token = github_token or os.getenv("GITHUB_TOKEN")
@@ -181,12 +163,16 @@ class CodeReviewAgentSystem:
         self.tools = self._create_tools()
         self.agent_executor = self._create_agent()
 
-    def _fetch_pr_data_tool(self, repo_url: str, pr_number: int) -> str:
+    def _fetch_pr_data_impl(self, input_str: str) -> str:
         try:
+            data = json.loads(input_str)
+            repo_url = data.get("repo_url")
+            pr_number = data.get("pr_number")
+            
             parts = repo_url.rstrip("/").split("github.com/")[-1].split("/")
             owner, repo = parts[0], parts[1]
             
-            logger.info(f"Fetching PR data for {owner}/{repo} #{pr_number}")
+            logger.info(f"Tool: Fetching PR data for {owner}/{repo} #{pr_number}")
             
             pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
             response = requests.get(pr_url, headers=self.headers)
@@ -208,13 +194,18 @@ class CodeReviewAgentSystem:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-    def _analyze_code_tool(self, filename: str, patch: str) -> str:
-        if not patch:
-            return json.dumps({"issues": []})
-        
-        logger.info(f"Analyzing file: {filename}")
-        
-        prompt = f"""You are a ruthless, detail-obsessed senior code reviewer. Find every possible issue.
+    def _analyze_code_impl(self, input_str: str) -> str:
+        try:
+            data = json.loads(input_str)
+            filename = data.get("filename")
+            patch = data.get("patch")
+            
+            if not patch:
+                return json.dumps({"issues": []})
+            
+            logger.info(f"Tool: Analyzing code in {filename}")
+            
+            prompt = f"""You are a ruthless code reviewer. Find every possible issue.
 
 Analyze this GitHub diff:
 
@@ -230,13 +221,10 @@ Return ONLY a valid JSON array of issues. Each issue must have:
 - "suggestion": clear recommendation for fixing
 
 Example:
-[{{"file": "{filename}", "line": 12, "type": "style", "description": "Missing space after comma", "suggestion": "Use proper spacing"}}]
+[{{"file": "{filename}", "line": 12, "type": "style", "description": "Missing space", "suggestion": "Add proper spacing"}}]"""
 
-If code looks fine, still return style feedback. Never return an empty list."""
-
-        try:
             response = self.llm.invoke([
-                SystemMessage(content="You are an unforgiving code reviewer. Output only valid JSON."),
+                SystemMessage(content="You are a code reviewer. Output only valid JSON."),
                 HumanMessage(content=prompt)
             ])
             
@@ -255,36 +243,32 @@ If code looks fine, still return style feedback. Never return an empty list."""
                     "file": filename,
                     "line": None,
                     "type": "readability",
-                    "description": "Model returned no issues — likely false negative.",
-                    "suggestion": "Review file structure and naming manually."
+                    "description": "Code structure could be improved",
+                    "suggestion": "Review file structure and naming"
                 }]
             
             return json.dumps({"issues": issues_data})
         except Exception as e:
-            logger.error(f"Error analyzing file {filename}: {str(e)}")
+            logger.error(f"Error in analyze_code_impl: {str(e)}")
             return json.dumps({"error": str(e), "issues": []})
 
-    def _security_scan_tool(self, code: str, filename: str) -> str:
-        logger.info(f"Running security scan on: {filename}")
-        
-        prompt = f"""You are a security expert. Scan this code for security vulnerabilities.
+    def _security_scan_impl(self, input_str: str) -> str:
+        try:
+            data = json.loads(input_str)
+            code = data.get("code")
+            filename = data.get("filename")
+            
+            logger.info(f"Tool: Security scan on {filename}")
+            
+            prompt = f"""You are a security expert. Scan this code for vulnerabilities.
 
 File: {filename}
 Code:
 {code}
 
-Focus on:
-- SQL injection vulnerabilities
-- XSS vulnerabilities
-- Authentication/authorization issues
-- Sensitive data exposure
-- Insecure dependencies
-- Hardcoded credentials
-
-Return a JSON array of security issues found:
+Return a JSON array of security issues:
 [{{"type": "security", "severity": "high|medium|low", "description": "...", "suggestion": "..."}}]"""
 
-        try:
             response = self.llm.invoke([
                 SystemMessage(content="You are a security auditor. Output only valid JSON."),
                 HumanMessage(content=prompt)
@@ -300,28 +284,24 @@ Return a JSON array of security issues found:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-    def _performance_analysis_tool(self, code: str, language: str) -> str:
-        logger.info(f"Running performance analysis on {language} code")
-        
-        prompt = f"""You are a performance optimization expert. Analyze this {language} code for performance issues.
+    def _performance_analysis_impl(self, input_str: str) -> str:
+        try:
+            data = json.loads(input_str)
+            code = data.get("code")
+            language = data.get("language")
+            
+            logger.info(f"Tool: Performance analysis on {language} code")
+            
+            prompt = f"""You are a performance expert. Analyze this {language} code.
 
 Code:
 {code}
 
-Focus on:
-- Time complexity issues
-- Memory leaks
-- Inefficient algorithms
-- Unnecessary computations
-- Database query optimization
-- Caching opportunities
-
 Return a JSON array of performance issues:
 [{{"type": "performance", "impact": "high|medium|low", "description": "...", "suggestion": "..."}}]"""
 
-        try:
             response = self.llm.invoke([
-                SystemMessage(content="You are a performance optimization expert. Output only valid JSON."),
+                SystemMessage(content="You are a performance expert. Output only valid JSON."),
                 HumanMessage(content=prompt)
             ])
             
@@ -335,55 +315,55 @@ Return a JSON array of performance issues:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-    def _create_tools(self) -> List[StructuredTool]:
-        fetch_pr_tool = StructuredTool.from_function(
-            func=self._fetch_pr_data_tool,
-            name="fetch_pr_data",
-            description="Fetches pull request data from GitHub including title, URL, and file changes",
-            args_schema=FetchPRToolInput
-        )
-        
-        analyze_code_tool = StructuredTool.from_function(
-            func=self._analyze_code_tool,
-            name="analyze_code",
-            description="Analyzes code diff and identifies bugs, style issues, performance problems, and security vulnerabilities",
-            args_schema=AnalyzeCodeToolInput
-        )
-        
-        security_scan_tool = StructuredTool.from_function(
-            func=self._security_scan_tool,
-            name="security_scan",
-            description="Performs deep security vulnerability scanning on code",
-            args_schema=SecurityScanToolInput
-        )
-        
-        performance_tool = StructuredTool.from_function(
-            func=self._performance_analysis_tool,
-            name="performance_analysis",
-            description="Analyzes code for performance bottlenecks and optimization opportunities",
-            args_schema=PerformanceAnalysisToolInput
-        )
-        
-        return [fetch_pr_tool, analyze_code_tool, security_scan_tool, performance_tool]
+    def _create_tools(self) -> List[Tool]:
+        tools = [
+            Tool(
+                name="fetch_pr_data",
+                func=self._fetch_pr_data_impl,
+                description='Fetches PR data from GitHub. Input should be JSON string like: {"repo_url": "https://github.com/owner/repo", "pr_number": 123}'
+            ),
+            Tool(
+                name="analyze_code",
+                func=self._analyze_code_impl,
+                description='Analyzes code diff for issues. Input should be JSON string like: {"filename": "file.py", "patch": "diff content"}'
+            ),
+            Tool(
+                name="security_scan",
+                func=self._security_scan_impl,
+                description='Scans code for security vulnerabilities. Input should be JSON string like: {"code": "code content", "filename": "file.py"}'
+            ),
+            Tool(
+                name="performance_analysis",
+                func=self._performance_analysis_impl,
+                description='Analyzes code for performance issues. Input should be JSON string like: {"code": "code content", "language": "python"}'
+            )
+        ]
+        return tools
 
     def _create_agent(self) -> AgentExecutor:
-        system_template = """You are an expert code review agent. Perform comprehensive code reviews on GitHub pull requests.
+        template = """Answer the following questions as best you can. You have access to the following tools:
 
-When analyzing a PR, follow this process:
-1. Fetch the PR data and files
-2. Analyze each file for code issues
-3. Perform security scans
-4. Check for performance issues
+{tools}
 
-Be thorough and systematic in your analysis."""
+Use the following format:
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_template),
-            ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Begin!
+
+Question: {input}
+Thought:{agent_scratchpad}"""
+
+        prompt = PromptTemplate.from_template(template)
         
-        agent = create_structured_chat_agent(
+        agent = create_react_agent(
             llm=self.llm,
             tools=self.tools,
             prompt=prompt
@@ -394,15 +374,14 @@ Be thorough and systematic in your analysis."""
             tools=self.tools,
             verbose=True,
             handle_parsing_errors=True,
-            max_iterations=15,
-            return_intermediate_steps=False
+            max_iterations=15
         )
         
         return agent_executor
 
     def analyze_pr(self, repo_url: str, pr_number: int) -> PRAnalysisResult:
         try:
-            pr_data_str = self._fetch_pr_data_tool(repo_url, pr_number)
+            pr_data_str = self._fetch_pr_data_impl(json.dumps({"repo_url": repo_url, "pr_number": pr_number}))
             pr_data = json.loads(pr_data_str)
             
             if "error" in pr_data:
@@ -419,10 +398,10 @@ Be thorough and systematic in your analysis."""
                 if not patch:
                     continue
                 
-                analysis_result = self._analyze_code_tool(filename, patch)
+                analysis_result = self._analyze_code_impl(json.dumps({"filename": filename, "patch": patch}))
                 analysis_data = json.loads(analysis_result)
                 
-                security_result = self._security_scan_tool(patch, filename)
+                security_result = self._security_scan_impl(json.dumps({"code": patch, "filename": filename}))
                 try:
                     security_data = json.loads(security_result)
                     if isinstance(security_data, list):
@@ -438,7 +417,7 @@ Be thorough and systematic in your analysis."""
                     pass
                 
                 language = filename.split(".")[-1] if "." in filename else "unknown"
-                perf_result = self._performance_analysis_tool(patch, language)
+                perf_result = self._performance_analysis_impl(json.dumps({"code": patch, "language": language}))
                 try:
                     perf_data = json.loads(perf_result)
                     if isinstance(perf_data, list):
@@ -615,7 +594,7 @@ async def root():
     return {
         "message": "AI Code Review Agent (Agentic Architecture with LangChain)",
         "version": "3.0.0",
-        "framework": "LangChain Agent Framework",
+        "framework": "LangChain ReAct Agent Framework",
         "storage": "Redis" if redis_client else "In-Memory",
         "tools": [
             "fetch_pr_data - GitHub PR data retrieval",
