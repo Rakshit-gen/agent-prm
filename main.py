@@ -67,6 +67,7 @@ class FileAnalysis(BaseModel):
     issues: List[Issue] = Field(default_factory=list, description="List of issues found")
     error: Optional[str] = Field(None, description="Error message if analysis failed")
     agent_breakdown: Optional[Dict[str, int]] = Field(default_factory=dict, description="Issues by agent")
+    code_content: Optional[str] = Field(None, description="File code content or patch")
 
 class AgentProgress(BaseModel):
     agent: str
@@ -248,9 +249,15 @@ def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_toke
         
         analysis_results = orchestrator.analyze_pr(pr_data)
         
+        # Store original PR data for code content
+        pr_files_map = {f.get("filename"): f.get("patch", "") for f in pr_data.get("files", [])}
+        
         # Convert to PRAnalysisResult format
         files_analysis = []
         for file_data in analysis_results.get("files", []):
+            filename = file_data.get("name", "unknown")
+            code_content = pr_files_map.get(filename, "")
+            
             issues = []
             for issue_data in file_data.get("issues", []):
                 # Map issue types
@@ -303,7 +310,8 @@ def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_toke
             file_analysis = FileAnalysis(
                 name=file_data.get("name", "unknown"),
                 issues=issues,
-                agent_breakdown=file_data.get("agent_breakdown", {})
+                agent_breakdown=file_data.get("agent_breakdown", {}),
+                code_content=code_content
             )
             files_analysis.append(file_analysis)
         
