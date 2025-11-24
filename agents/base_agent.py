@@ -11,6 +11,8 @@ from langchain.schema import SystemMessage, HumanMessage
 import json
 import logging
 import os
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +27,15 @@ class BaseAgent(ABC):
         if not groq_api_key:
             raise ValueError("GROQ_API_KEY not found in environment variables")
         
-        # Use faster model for speed optimization
+        # Use model with better rate limits - fallback to 70b if 8b hits limits
+        # Try 8b first, but it has stricter rate limits
+        self.model_name = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")  # Default to 70b for better rate limits
         self.llm = ChatGroq(
-            model="llama-3.1-8b-instant",
+            model=self.model_name,
             temperature=0.1,
             groq_api_key=groq_api_key,
-            max_tokens=2000
+            max_tokens=2000,
+            request_timeout=60  # Increase timeout
         )
         
         self.tools = self._create_tools()
@@ -98,8 +103,14 @@ Thought:{{agent_scratchpad}}"""
         """Perform analysis and return results"""
         pass
     
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((Exception,)),
+        reraise=True
+    )
     def invoke_llm(self, prompt: str, system_message: Optional[str] = None, max_tokens: int = 1500) -> str:
-        """Helper method to invoke LLM with optimized settings"""
+        """Helper method to invoke LLM with retry logic for rate limiting"""
         messages = []
         if system_message:
             # Use shorter system message for speed
@@ -108,8 +119,16 @@ Thought:{{agent_scratchpad}}"""
         truncated_prompt = prompt[:3000] + "..." if len(prompt) > 3000 else prompt
         messages.append(HumanMessage(content=truncated_prompt))
         
-        response = self.llm.invoke(messages)
-        return response.content.strip()
+        try:
+            response = self.llm.invoke(messages)
+            return response.content.strip()
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "rate limit" in error_str:
+                logger.warning(f"Rate limit hit, waiting before retry...")
+                time.sleep(5)  # Wait 5 seconds before retry
+                raise  # Re-raise to trigger retry
+            raise
     
     def parse_json_response(self, response_text: str) -> Any:
         """Parse JSON from LLM response"""

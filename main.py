@@ -266,15 +266,34 @@ def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_toke
                 
                 # Sanitize line number - convert 0 or negative to None
                 line_num = issue_data.get("line")
-                if line_num is not None and (line_num < 1 or line_num == 0):
-                    line_num = None
+                if line_num is not None:
+                    try:
+                        line_num = int(line_num)
+                        if line_num < 1 or line_num == 0:
+                            line_num = None
+                    except (ValueError, TypeError):
+                        line_num = None
+                
+                # Sanitize description and suggestion - ensure they're not empty
+                description = str(issue_data.get("description", "")).strip()
+                if not description:
+                    description = "Issue detected"
+                
+                suggestion = str(issue_data.get("suggestion", "")).strip()
+                if not suggestion:
+                    suggestion = "Review and fix the issue"
+                
+                # Ensure file name is valid
+                file_name = str(issue_data.get("file", file_data.get("name", "unknown"))).strip()
+                if not file_name:
+                    file_name = "unknown"
                 
                 issue = Issue(
-                    file=issue_data.get("file", file_data.get("name", "unknown")),
+                    file=file_name,
                     line=line_num,
-                    type=issue_type,
-                    description=issue_data.get("description", ""),
-                    suggestion=issue_data.get("suggestion", ""),
+                    type=str(issue_type).strip() or "readability",
+                    description=description,
+                    suggestion=suggestion,
                     detected_by=issue_data.get("detected_by"),
                     severity=issue_data.get("severity") or issue_data.get("impact"),
                     impact=issue_data.get("impact") or issue_data.get("severity")

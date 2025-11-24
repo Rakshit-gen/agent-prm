@@ -2,9 +2,9 @@
 Agent Orchestrator - Coordinates multiple specialized agents
 """
 from typing import Dict, Any, List, Optional, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import json
+import time
 from datetime import datetime
 
 from .security_agent import SecurityAgent
@@ -76,54 +76,46 @@ class AgentOrchestrator:
             "files": []
         }
         
-        # Run agents in parallel for efficiency
-        with ThreadPoolExecutor(max_workers=len(self.agents)) as executor:
-            futures = {}
+        # Run agents sequentially with delays to avoid rate limits
+        for idx, (agent_key, agent) in enumerate(self.agents.items()):
+            agent_name = self.agent_names[agent_key]
+            self._update_progress(agent_name, "starting", 0.0, f"{agent_name} initialized")
             
-            # Start all agents
-            for agent_key, agent in self.agents.items():
-                agent_name = self.agent_names[agent_key]
-                self._update_progress(agent_name, "starting", 0.0, f"{agent_name} initialized")
-                
-                future = executor.submit(self._run_agent, agent, agent_key, context)
-                futures[future] = agent_key
+            # Add delay between agent starts to avoid rate limits (except first)
+            if idx > 0:
+                time.sleep(2)  # 2 second delay between agents
             
-            # Collect results as they complete
-            for future in as_completed(futures):
-                agent_key = futures[future]
-                agent_name = self.agent_names[agent_key]
+            try:
+                self._update_progress(agent_name, "analyzing", 0.5, f"{agent_name} analyzing...")
+                agent_result = self._run_agent(agent, agent_key, context)
+                results["agents"][agent_key] = agent_result
+                results["summary"]["agents_completed"] += 1
                 
-                try:
-                    self._update_progress(agent_name, "analyzing", 0.5, f"{agent_name} analyzing...")
-                    agent_result = future.result()
-                    results["agents"][agent_key] = agent_result
-                    results["summary"]["agents_completed"] += 1
-                    
-                    # Update summary statistics
-                    if "summary" in agent_result:
-                        agent_summary = agent_result["summary"]
-                        if "total_issues" in agent_summary:
-                            results["summary"]["total_issues"] += agent_summary["total_issues"]
-                        if "critical" in agent_summary:
-                            results["summary"]["critical_issues"] += agent_summary["critical"]
-                        if "high" in agent_summary:
-                            results["summary"]["high_priority_issues"] += agent_summary["high"]
-                        if "high_severity" in agent_summary:
-                            results["summary"]["high_priority_issues"] += agent_summary["high_severity"]
-                        if "high_impact" in agent_summary:
-                            results["summary"]["high_priority_issues"] += agent_summary["high_impact"]
-                    
-                    self._update_progress(agent_name, "completed", 1.0, f"{agent_name} completed")
-                    
-                except Exception as e:
-                    logger.error(f"Agent {agent_key} failed: {str(e)}")
-                    results["agents"][agent_key] = {
-                        "agent": agent_key,
-                        "error": str(e),
-                        "issues": [],
-                        "summary": {}
-                    }
-                    self._update_progress(agent_name, "error", 0.0, f"{agent_name} failed: {str(e)}")
+                # Update summary statistics
+                if "summary" in agent_result:
+                    agent_summary = agent_result["summary"]
+                    if "total_issues" in agent_summary:
+                        results["summary"]["total_issues"] += agent_summary["total_issues"]
+                    if "critical" in agent_summary:
+                        results["summary"]["critical_issues"] += agent_summary["critical"]
+                    if "high" in agent_summary:
+                        results["summary"]["high_priority_issues"] += agent_summary["high"]
+                    if "high_severity" in agent_summary:
+                        results["summary"]["high_priority_issues"] += agent_summary["high_severity"]
+                    if "high_impact" in agent_summary:
+                        results["summary"]["high_priority_issues"] += agent_summary["high_impact"]
+                
+                self._update_progress(agent_name, "completed", 1.0, f"{agent_name} completed")
+                
+            except Exception as e:
+                logger.error(f"Agent {agent_key} failed: {str(e)}")
+                results["agents"][agent_key] = {
+                    "agent": agent_key,
+                    "error": str(e),
+                    "issues": [],
+                    "summary": {}
+                }
+                self._update_progress(agent_name, "error", 0.0, f"{agent_name} failed: {str(e)}")
         
         # Aggregate issues by file
         file_issues_map = {}
@@ -182,4 +174,3 @@ class AgentOrchestrator:
                 for agent_key in self.agents.keys()
             }
         }
-
