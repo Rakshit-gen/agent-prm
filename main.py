@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from pydantic import BaseModel, Field, field_validator, model_validator
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from enum import Enum
@@ -10,15 +11,10 @@ import logging
 import json
 import redis
 from rate_limiter import RateLimiter, rate_limit
-from fastapi.middleware.cors import CORSMiddleware
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.tools import Tool
-from langchain_groq import ChatGroq
-from langchain.prompts import PromptTemplate
-from langchain.schema import SystemMessage, HumanMessage
+from agents.orchestrator import AgentOrchestrator
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ai-pr-review")
+logger = logging.getLogger("multiagent-pr-review")
 
 class IssueType(str, Enum):
     BUG = "bug"
@@ -27,6 +23,8 @@ class IssueType(str, Enum):
     SECURITY = "security"
     MAINTAINABILITY = "maintainability"
     READABILITY = "readability"
+    ARCHITECTURE = "architecture"
+    QUALITY = "quality"
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
@@ -49,48 +47,41 @@ class PRRequest(BaseModel):
 class Issue(BaseModel):
     file: str = Field(..., description="File name where issue was found")
     line: Optional[int] = Field(None, ge=1, description="Line number in file")
-    type: IssueType = Field(..., description="Type of issue")
+    type: str = Field(..., description="Type of issue")
     description: str = Field(..., min_length=1, description="Issue description")
     suggestion: str = Field(..., min_length=1, description="Suggested fix")
-
-    model_config = {
-        "use_enum_values": True
-    }
+    detected_by: Optional[str] = Field(None, description="Agent that detected the issue")
+    severity: Optional[str] = Field(None, description="Severity level")
+    impact: Optional[str] = Field(None, description="Impact level")
 
 class FileAnalysis(BaseModel):
     name: str = Field(..., description="File name")
     issues: List[Issue] = Field(default_factory=list, description="List of issues found")
     error: Optional[str] = Field(None, description="Error message if analysis failed")
+    agent_breakdown: Optional[Dict[str, int]] = Field(default_factory=dict, description="Issues by agent")
 
-    @property
-    def issue_count(self) -> int:
-        return len(self.issues)
-
-    @property
-    def critical_issue_count(self) -> int:
-        return sum(1 for issue in self.issues if issue.type in [IssueType.BUG, IssueType.SECURITY])
+class AgentProgress(BaseModel):
+    agent: str
+    status: str
+    progress: float
+    message: str
+    timestamp: str
 
 class AnalysisSummary(BaseModel):
     total_files: int = Field(..., ge=0, description="Total number of files analyzed")
     total_issues: int = Field(..., ge=0, description="Total number of issues found")
     critical_issues: int = Field(..., ge=0, description="Number of critical issues")
-
-    @model_validator(mode='after')
-    def validate_issue_counts(self):
-        if self.critical_issues > self.total_issues:
-            raise ValueError("Critical issues cannot exceed total issues")
-        return self
+    high_priority_issues: int = Field(..., ge=0, description="Number of high priority issues")
+    total_agents: int = Field(..., ge=0, description="Total number of agents")
+    agents_completed: int = Field(..., ge=0, description="Number of agents completed")
 
 class PRAnalysisResult(BaseModel):
     pr_title: str = Field(..., description="Pull request title")
     pr_url: str = Field(..., description="Pull request URL")
-    analyzed_at: datetime = Field(..., description="Analysis timestamp")
+    analyzed_at: str = Field(..., description="Analysis timestamp")
     files: List[FileAnalysis] = Field(default_factory=list, description="File analysis results")
     summary: AnalysisSummary = Field(..., description="Analysis summary")
-
-    model_config = {
-        "json_encoders": {datetime: lambda v: v.isoformat()}
-    }
+    agents: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Agent-specific results")
 
 class TaskResponse(BaseModel):
     task_id: str = Field(..., description="Unique task identifier")
@@ -102,6 +93,7 @@ class TaskStatusResponse(BaseModel):
     status: TaskStatus
     created_at: Optional[str] = None
     error: Optional[str] = None
+    progress: Optional[List[AgentProgress]] = None
 
 class TaskResultResponse(BaseModel):
     task_id: str
@@ -115,13 +107,14 @@ class TaskData(BaseModel):
     pr_number: int
     results: Optional[PRAnalysisResult] = None
     error: Optional[str] = None
+    progress: List[AgentProgress] = Field(default_factory=list)
 
-app = FastAPI(title="AI Code Review Agent (Agentic Architecture)")
+app = FastAPI(title="Multiagentic AI Code Review System", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -142,334 +135,36 @@ else:
 
 app.state.rate_limiter = RateLimiter(redis_client)
 tasks_store: Dict[str, Dict[str, Any]] = {}
+task_progress: Dict[str, List[Dict[str, Any]]] = {}
 
-class CodeReviewAgentSystem:
-    def __init__(self, github_token: str = None):
-        self.github_token = github_token or os.getenv("GITHUB_TOKEN")
-        groq_api_key = os.getenv("GROQ_API_KEY")
-        if not groq_api_key:
-            raise ValueError("GROQ_API_KEY not found in environment variables")
-        
-        self.llm = ChatGroq(
-            model="llama-3.3-70b-versatile",
-            temperature=0.1,
-            groq_api_key=groq_api_key
-        )
-        
-        self.headers = {}
-        if self.github_token:
-            self.headers["Authorization"] = f"token {self.github_token}"
-        
-        self.tools = self._create_tools()
-        self.agent_executor = self._create_agent()
-
-    def _fetch_pr_data_impl(self, input_str: str) -> str:
-        try:
-            data = json.loads(input_str)
-            repo_url = data.get("repo_url")
-            pr_number = data.get("pr_number")
-            
-            parts = repo_url.rstrip("/").split("github.com/")[-1].split("/")
-            owner, repo = parts[0], parts[1]
-            
-            logger.info(f"Tool: Fetching PR data for {owner}/{repo} #{pr_number}")
-            
-            pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
-            response = requests.get(pr_url, headers=self.headers)
-            response.raise_for_status()
-            pr_data = response.json()
-            
-            files_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
-            response = requests.get(files_url, headers=self.headers)
-            response.raise_for_status()
-            files_data = response.json()
-            
-            result = {
-                "pr_title": pr_data.get("title", ""),
-                "pr_url": pr_data.get("html_url", ""),
-                "files": [{"filename": f.get("filename"), "patch": f.get("patch", "")} for f in files_data]
-            }
-            
-            return json.dumps(result)
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-    def _analyze_code_impl(self, input_str: str) -> str:
-        try:
-            data = json.loads(input_str)
-            filename = data.get("filename")
-            patch = data.get("patch")
-            
-            if not patch:
-                return json.dumps({"issues": []})
-            
-            logger.info(f"Tool: Analyzing code in {filename}")
-            
-            prompt = f"""You are a ruthless code reviewer. Find every possible issue.
-
-Analyze this GitHub diff:
-
-File: {filename}
-Diff:
-{patch}
-
-Return ONLY a valid JSON array of issues. Each issue must have:
-- "file": file name
-- "line": approximate line number (integer or null)
-- "type": one of ["bug", "style", "performance", "security", "maintainability", "readability"]
-- "description": concise but specific explanation
-- "suggestion": clear recommendation for fixing
-
-Example:
-[{{"file": "{filename}", "line": 12, "type": "style", "description": "Missing space", "suggestion": "Add proper spacing"}}]"""
-
-            response = self.llm.invoke([
-                SystemMessage(content="You are a code reviewer. Output only valid JSON."),
-                HumanMessage(content=prompt)
-            ])
-            
-            response_text = response.content.strip()
-            
-            if response_text.startswith("```json"):
-                response_text = response_text[7:]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-            response_text = response_text.strip()
-            
-            issues_data = json.loads(response_text)
-            
-            if not isinstance(issues_data, list) or len(issues_data) == 0:
-                issues_data = [{
-                    "file": filename,
-                    "line": None,
-                    "type": "readability",
-                    "description": "Code structure could be improved",
-                    "suggestion": "Review file structure and naming"
-                }]
-            
-            return json.dumps({"issues": issues_data})
-        except Exception as e:
-            logger.error(f"Error in analyze_code_impl: {str(e)}")
-            return json.dumps({"error": str(e), "issues": []})
-
-    def _security_scan_impl(self, input_str: str) -> str:
-        try:
-            data = json.loads(input_str)
-            code = data.get("code")
-            filename = data.get("filename")
-            
-            logger.info(f"Tool: Security scan on {filename}")
-            
-            prompt = f"""You are a security expert. Scan this code for vulnerabilities.
-
-File: {filename}
-Code:
-{code}
-
-Return a JSON array of security issues:
-[{{"type": "security", "severity": "high|medium|low", "description": "...", "suggestion": "..."}}]"""
-
-            response = self.llm.invoke([
-                SystemMessage(content="You are a security auditor. Output only valid JSON."),
-                HumanMessage(content=prompt)
-            ])
-            
-            response_text = response.content.strip()
-            if response_text.startswith("```json"):
-                response_text = response_text[7:]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-            
-            return response_text.strip()
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-    def _performance_analysis_impl(self, input_str: str) -> str:
-        try:
-            data = json.loads(input_str)
-            code = data.get("code")
-            language = data.get("language")
-            
-            logger.info(f"Tool: Performance analysis on {language} code")
-            
-            prompt = f"""You are a performance expert. Analyze this {language} code.
-
-Code:
-{code}
-
-Return a JSON array of performance issues:
-[{{"type": "performance", "impact": "high|medium|low", "description": "...", "suggestion": "..."}}]"""
-
-            response = self.llm.invoke([
-                SystemMessage(content="You are a performance expert. Output only valid JSON."),
-                HumanMessage(content=prompt)
-            ])
-            
-            response_text = response.content.strip()
-            if response_text.startswith("```json"):
-                response_text = response_text[7:]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-            
-            return response_text.strip()
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-    def _create_tools(self) -> List[Tool]:
-        tools = [
-            Tool(
-                name="fetch_pr_data",
-                func=self._fetch_pr_data_impl,
-                description='Fetches PR data from GitHub. Input should be JSON string like: {"repo_url": "https://github.com/owner/repo", "pr_number": 123}'
-            ),
-            Tool(
-                name="analyze_code",
-                func=self._analyze_code_impl,
-                description='Analyzes code diff for issues. Input should be JSON string like: {"filename": "file.py", "patch": "diff content"}'
-            ),
-            Tool(
-                name="security_scan",
-                func=self._security_scan_impl,
-                description='Scans code for security vulnerabilities. Input should be JSON string like: {"code": "code content", "filename": "file.py"}'
-            ),
-            Tool(
-                name="performance_analysis",
-                func=self._performance_analysis_impl,
-                description='Analyzes code for performance issues. Input should be JSON string like: {"code": "code content", "language": "python"}'
-            )
-        ]
-        return tools
-
-    def _create_agent(self) -> AgentExecutor:
-        template = """Answer the following questions as best you can. You have access to the following tools:
-
-{tools}
-
-Use the following format:
-
-Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
-
-Begin!
-
-Question: {input}
-Thought:{agent_scratchpad}"""
-
-        prompt = PromptTemplate.from_template(template)
-        
-        agent = create_react_agent(
-            llm=self.llm,
-            tools=self.tools,
-            prompt=prompt
-        )
-        
-        agent_executor = AgentExecutor(
-            agent=agent,
-            tools=self.tools,
-            verbose=True,
-            handle_parsing_errors=True,
-            max_iterations=15
-        )
-        
-        return agent_executor
-
-    def analyze_pr(self, repo_url: str, pr_number: int) -> PRAnalysisResult:
-        try:
-            pr_data_str = self._fetch_pr_data_impl(json.dumps({"repo_url": repo_url, "pr_number": pr_number}))
-            pr_data = json.loads(pr_data_str)
-            
-            if "error" in pr_data:
-                raise Exception(pr_data["error"])
-            
-            analyzed_files = []
-            total_issues = 0
-            critical_issues = 0
-            
-            for file_data in pr_data["files"]:
-                filename = file_data["filename"]
-                patch = file_data["patch"]
-                
-                if not patch:
-                    continue
-                
-                analysis_result = self._analyze_code_impl(json.dumps({"filename": filename, "patch": patch}))
-                analysis_data = json.loads(analysis_result)
-                
-                security_result = self._security_scan_impl(json.dumps({"code": patch, "filename": filename}))
-                try:
-                    security_data = json.loads(security_result)
-                    if isinstance(security_data, list):
-                        for sec_issue in security_data:
-                            analysis_data.setdefault("issues", []).append({
-                                "file": filename,
-                                "line": None,
-                                "type": "security",
-                                "description": sec_issue.get("description", "Security issue found"),
-                                "suggestion": sec_issue.get("suggestion", "Review security implications")
-                            })
-                except:
-                    pass
-                
-                language = filename.split(".")[-1] if "." in filename else "unknown"
-                perf_result = self._performance_analysis_impl(json.dumps({"code": patch, "language": language}))
-                try:
-                    perf_data = json.loads(perf_result)
-                    if isinstance(perf_data, list):
-                        for perf_issue in perf_data:
-                            analysis_data.setdefault("issues", []).append({
-                                "file": filename,
-                                "line": None,
-                                "type": "performance",
-                                "description": perf_issue.get("description", "Performance issue found"),
-                                "suggestion": perf_issue.get("suggestion", "Optimize for better performance")
-                            })
-                except:
-                    pass
-                
-                issues = []
-                for issue_data in analysis_data.get("issues", []):
-                    issue = Issue(
-                        file=issue_data.get("file", filename),
-                        line=issue_data.get("line"),
-                        type=issue_data.get("type", "readability"),
-                        description=issue_data.get("description", ""),
-                        suggestion=issue_data.get("suggestion", "")
-                    )
-                    issues.append(issue)
-                    total_issues += 1
-                    if issue.type in [IssueType.BUG, IssueType.SECURITY]:
-                        critical_issues += 1
-                
-                file_analysis = FileAnalysis(
-                    name=filename,
-                    issues=issues,
-                    error=analysis_data.get("error")
-                )
-                analyzed_files.append(file_analysis)
-            
-            summary = AnalysisSummary(
-                total_files=len(analyzed_files),
-                total_issues=total_issues,
-                critical_issues=critical_issues
-            )
-            
-            return PRAnalysisResult(
-                pr_title=pr_data["pr_title"],
-                pr_url=pr_data["pr_url"],
-                analyzed_at=datetime.utcnow(),
-                files=analyzed_files,
-                summary=summary
-            )
-        
-        except Exception as e:
-            logger.error(f"Error in PR analysis: {str(e)}")
-            raise
+def fetch_pr_data(repo_url: str, pr_number: int, github_token: str = None) -> Dict[str, Any]:
+    """Fetch PR data from GitHub"""
+    headers = {}
+    if github_token:
+        headers["Authorization"] = f"token {github_token}"
+    elif os.getenv("GITHUB_TOKEN"):
+        headers["Authorization"] = f"token {os.getenv('GITHUB_TOKEN')}"
+    
+    parts = repo_url.rstrip("/").split("github.com/")[-1].split("/")
+    owner, repo = parts[0], parts[1]
+    
+    logger.info(f"Fetching PR data for {owner}/{repo} #{pr_number}")
+    
+    pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+    response = requests.get(pr_url, headers=headers)
+    response.raise_for_status()
+    pr_data = response.json()
+    
+    files_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
+    response = requests.get(files_url, headers=headers)
+    response.raise_for_status()
+    files_data = response.json()
+    
+    return {
+        "pr_title": pr_data.get("title", ""),
+        "pr_url": pr_data.get("html_url", ""),
+        "files": [{"filename": f.get("filename"), "patch": f.get("patch", "")} for f in files_data]
+    }
 
 def save_task(task_id: str, data: TaskData):
     data_dict = data.model_dump(mode='json')
@@ -495,25 +190,124 @@ def get_task(task_id: str) -> Optional[TaskData]:
         data_dict = tasks_store.get(task_id)
         return TaskData(**data_dict) if data_dict else None
 
+def update_progress(task_id: str, progress_data: Dict[str, Any]):
+    """Update progress for a task"""
+    if task_id not in task_progress:
+        task_progress[task_id] = []
+    task_progress[task_id].append(progress_data)
+    
+    # Also update in task data
+    task_data = get_task(task_id)
+    if task_data:
+        task_data.progress.append(AgentProgress(**progress_data))
+        save_task(task_id, task_data)
+
 def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_token: str = None):
+    """Process PR analysis using multiagentic system"""
     try:
         task_data = get_task(task_id)
         if task_data:
             task_data.status = TaskStatus.PROCESSING
             save_task(task_id, task_data)
         
-        logger.info(f"Starting agentic PR analysis for task {task_id}")
+        logger.info(f"Starting multiagentic PR analysis for task {task_id}")
         
-        agent_system = CodeReviewAgentSystem(github_token)
-        results = agent_system.analyze_pr(repo_url, pr_number)
+        # Fetch PR data
+        update_progress(task_id, {
+            "agent": "System",
+            "status": "fetching",
+            "progress": 0.1,
+            "message": "Fetching PR data from GitHub",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        pr_data = fetch_pr_data(repo_url, pr_number, github_token)
+        
+        # Create orchestrator with progress callback
+        def progress_callback(progress: Dict[str, Any]):
+            update_progress(task_id, progress)
+        
+        orchestrator = AgentOrchestrator(github_token, progress_callback)
+        
+        # Run multiagentic analysis
+        update_progress(task_id, {
+            "agent": "System",
+            "status": "analyzing",
+            "progress": 0.2,
+            "message": "Initializing multiagentic analysis system",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        analysis_results = orchestrator.analyze_pr(pr_data)
+        
+        # Convert to PRAnalysisResult format
+        files_analysis = []
+        for file_data in analysis_results.get("files", []):
+            issues = []
+            for issue_data in file_data.get("issues", []):
+                # Map issue types
+                issue_type = issue_data.get("type", "readability")
+                if "security" in issue_type.lower():
+                    issue_type = "security"
+                elif "performance" in issue_type.lower():
+                    issue_type = "performance"
+                elif "architecture" in issue_type.lower() or "design" in issue_type.lower():
+                    issue_type = "architecture"
+                elif "quality" in issue_type.lower() or "smell" in issue_type.lower():
+                    issue_type = "quality"
+                
+                issue = Issue(
+                    file=issue_data.get("file", file_data.get("name", "unknown")),
+                    line=issue_data.get("line"),
+                    type=issue_type,
+                    description=issue_data.get("description", ""),
+                    suggestion=issue_data.get("suggestion", ""),
+                    detected_by=issue_data.get("detected_by"),
+                    severity=issue_data.get("severity") or issue_data.get("impact"),
+                    impact=issue_data.get("impact") or issue_data.get("severity")
+                )
+                issues.append(issue)
+            
+            file_analysis = FileAnalysis(
+                name=file_data.get("name", "unknown"),
+                issues=issues,
+                agent_breakdown=file_data.get("agent_breakdown", {})
+            )
+            files_analysis.append(file_analysis)
+        
+        summary = AnalysisSummary(
+            total_files=analysis_results.get("summary", {}).get("total_files", 0),
+            total_issues=analysis_results.get("summary", {}).get("total_issues", 0),
+            critical_issues=analysis_results.get("summary", {}).get("critical_issues", 0),
+            high_priority_issues=analysis_results.get("summary", {}).get("high_priority_issues", 0),
+            total_agents=analysis_results.get("summary", {}).get("total_agents", 0),
+            agents_completed=analysis_results.get("summary", {}).get("agents_completed", 0)
+        )
+        
+        result = PRAnalysisResult(
+            pr_title=analysis_results.get("pr_title", ""),
+            pr_url=analysis_results.get("pr_url", ""),
+            analyzed_at=analysis_results.get("analyzed_at", datetime.utcnow().isoformat()),
+            files=files_analysis,
+            summary=summary,
+            agents=analysis_results.get("agents", {})
+        )
         
         task_data = get_task(task_id)
         if task_data:
             task_data.status = TaskStatus.COMPLETED
-            task_data.results = results
+            task_data.results = result
             save_task(task_id, task_data)
         
-        logger.info(f"Completed agentic PR analysis for task {task_id}")
+        update_progress(task_id, {
+            "agent": "System",
+            "status": "completed",
+            "progress": 1.0,
+            "message": "Multiagentic analysis completed",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        logger.info(f"Completed multiagentic PR analysis for task {task_id}")
     
     except Exception as e:
         logger.error(f"Failed PR analysis for task {task_id}: {str(e)}")
@@ -522,6 +316,14 @@ def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_toke
             task_data.status = TaskStatus.FAILED
             task_data.error = str(e)
             save_task(task_id, task_data)
+        
+        update_progress(task_id, {
+            "agent": "System",
+            "status": "error",
+            "progress": 0.0,
+            "message": f"Analysis failed: {str(e)}",
+            "timestamp": datetime.utcnow().isoformat()
+        })
 
 @app.post("/analyze-pr", response_model=TaskResponse)
 @rate_limit(max_requests=10, window_seconds=60)
@@ -545,12 +347,12 @@ async def analyze_pr(request: Request, pr_request: PRRequest, background_tasks: 
             pr_request.github_token
         )
         
-        logger.info(f"Created agentic task {task_id}")
+        logger.info(f"Created multiagentic task {task_id}")
         
         return TaskResponse(
             task_id=task_id,
             status=TaskStatus.PENDING,
-            message="PR analysis task created successfully with agentic framework"
+            message="Multiagentic PR analysis task created successfully"
         )
     
     except Exception as e:
@@ -563,11 +365,16 @@ async def get_status(task_id: str):
     if not task_data:
         raise HTTPException(status_code=404, detail="Task not found")
     
+    progress_list = task_progress.get(task_id, [])
+    if not progress_list and task_data.progress:
+        progress_list = [p.model_dump() for p in task_data.progress]
+    
     return TaskStatusResponse(
         task_id=task_id,
         status=task_data.status,
         created_at=task_data.created_at,
-        error=task_data.error
+        error=task_data.error,
+        progress=[AgentProgress(**p) for p in progress_list] if progress_list else None
     )
 
 @app.get("/results/{task_id}", response_model=TaskResultResponse)
@@ -589,23 +396,61 @@ async def get_results(task_id: str):
     else:
         raise HTTPException(status_code=500, detail=f"Unknown task state: {task_data.status}")
 
+@app.websocket("/ws/{task_id}")
+async def websocket_endpoint(websocket: WebSocket, task_id: str):
+    """WebSocket endpoint for real-time progress updates"""
+    await websocket.accept()
+    try:
+        while True:
+            task_data = get_task(task_id)
+            if not task_data:
+                await websocket.send_json({"error": "Task not found"})
+                break
+            
+            progress_list = task_progress.get(task_id, [])
+            if not progress_list and task_data.progress:
+                progress_list = [p.model_dump() for p in task_data.progress]
+            
+            await websocket.send_json({
+                "status": task_data.status.value,
+                "progress": progress_list,
+                "error": task_data.error
+            })
+            
+            if task_data.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
+                break
+            
+            import asyncio
+            await asyncio.sleep(2)  # Update every 2 seconds
+    
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for task {task_id}")
+
 @app.get("/")
 async def root():
     return {
-        "message": "AI Code Review Agent (Agentic Architecture with LangChain)",
-        "version": "3.0.0",
-        "framework": "LangChain ReAct Agent Framework",
+        "message": "Multiagentic AI Code Review System",
+        "version": "4.0.0",
+        "architecture": "Multiagentic with Agent Orchestration",
         "storage": "Redis" if redis_client else "In-Memory",
-        "tools": [
-            "fetch_pr_data - GitHub PR data retrieval",
-            "analyze_code - Code diff analysis",
-            "security_scan - Security vulnerability detection",
-            "performance_analysis - Performance optimization analysis"
+        "agents": [
+            "SecurityAgent - Vulnerability detection and security analysis",
+            "PerformanceAgent - Performance optimization and analysis",
+            "ArchitectureAgent - Design patterns and architecture review",
+            "QualityAgent - Code quality and maintainability"
+        ],
+        "features": [
+            "Real-time progress tracking",
+            "WebSocket support for live updates",
+            "Parallel agent execution",
+            "Deep analysis with multiple specialized agents",
+            "Comprehensive issue detection"
         ],
         "endpoints": {
-            "POST /analyze-pr": "Submit a PR for agentic AI review",
-            "GET /status/{task_id}": "Check task status",
-            "GET /results/{task_id}": "Get comprehensive analysis results"
+            "POST /analyze-pr": "Submit a PR for multiagentic AI review",
+            "GET /status/{task_id}": "Check task status and progress",
+            "GET /results/{task_id}": "Get comprehensive analysis results",
+            "WS /ws/{task_id}": "WebSocket for real-time progress updates"
         }
     }
 
