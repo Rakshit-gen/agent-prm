@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from enum import Enum
@@ -46,13 +46,21 @@ class PRRequest(BaseModel):
 
 class Issue(BaseModel):
     file: str = Field(..., description="File name where issue was found")
-    line: Optional[int] = Field(None, ge=1, description="Line number in file")
+    line: Optional[int] = Field(None, description="Line number in file")
     type: str = Field(..., description="Type of issue")
     description: str = Field(..., min_length=1, description="Issue description")
     suggestion: str = Field(..., min_length=1, description="Suggested fix")
     detected_by: Optional[str] = Field(None, description="Agent that detected the issue")
     severity: Optional[str] = Field(None, description="Severity level")
     impact: Optional[str] = Field(None, description="Impact level")
+    
+    @field_validator('line')
+    @classmethod
+    def validate_line(cls, v):
+        """Convert invalid line numbers (0 or negative) to None"""
+        if v is not None and (v < 1 or v == 0):
+            return None
+        return v
 
 class FileAnalysis(BaseModel):
     name: str = Field(..., description="File name")
@@ -256,9 +264,14 @@ def process_pr_analysis(task_id: str, repo_url: str, pr_number: int, github_toke
                 elif "quality" in issue_type.lower() or "smell" in issue_type.lower():
                     issue_type = "quality"
                 
+                # Sanitize line number - convert 0 or negative to None
+                line_num = issue_data.get("line")
+                if line_num is not None and (line_num < 1 or line_num == 0):
+                    line_num = None
+                
                 issue = Issue(
                     file=issue_data.get("file", file_data.get("name", "unknown")),
-                    line=issue_data.get("line"),
+                    line=line_num,
                     type=issue_type,
                     description=issue_data.get("description", ""),
                     suggestion=issue_data.get("suggestion", ""),

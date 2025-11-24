@@ -131,6 +131,20 @@ Be concise. Max 10 issues."""
             }
         }
     
+    def _sanitize_issues(self, issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Sanitize issues to ensure valid line numbers"""
+        sanitized = []
+        for issue in issues:
+            # Convert 0 or negative line numbers to None
+            if "line" in issue and issue["line"] is not None:
+                if issue["line"] < 1 or issue["line"] == 0:
+                    issue["line"] = None
+            # Ensure file field exists
+            if "file" not in issue or not issue["file"]:
+                issue["file"] = "unknown"
+            sanitized.append(issue)
+        return sanitized
+    
     def _analyze_file(self, filename: str, code: str) -> List[Dict[str, Any]]:
         """Analyze a single file"""
         logger.info(f"SecurityAgent: Analyzing {filename}")
@@ -140,9 +154,19 @@ Be concise. Max 10 issues."""
         if isinstance(result, str):
             try:
                 parsed = json.loads(result)
-                return parsed if isinstance(parsed, list) else []
+                if isinstance(parsed, list):
+                    # Add filename to issues and sanitize
+                    for issue in parsed:
+                        if "file" not in issue:
+                            issue["file"] = filename
+                    return self._sanitize_issues(parsed)
+                return []
             except:
                 return []
         elif isinstance(result, list):
-            return result
+            # Add filename to issues and sanitize
+            for issue in result:
+                if "file" not in issue:
+                    issue["file"] = filename
+            return self._sanitize_issues(result)
         return []
