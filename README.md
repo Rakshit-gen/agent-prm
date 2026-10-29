@@ -47,12 +47,10 @@ You need Python 3.11+ and a [Groq API key](https://console.groq.com/keys). Redis
 git clone https://github.com/Rakshit-gen/agent-prm.git
 cd agent-prm
 python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt tenacity
+pip install -r requirements.txt
 cp .env.example .env   # then fill in GROQ_API_KEY
 uvicorn main:app --reload
 ```
-
-`tenacity` is used by the agents but is missing from `requirements.txt`, so install it by hand for now.
 
 Or with Docker (starts Redis too):
 
@@ -137,7 +135,7 @@ agents/*_agent.py          one file per review area
 tests/                     pytest tests for the API and the rate limiter
 ```
 
-Run the tests with `pytest -v`.
+Run the tests with `pytest -v`. Note: they were written for an earlier version of the API and many of them fail against the current code.
 
 ## Design choices
 
